@@ -706,6 +706,28 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    # NPU-friendly schedule for the diagonal sub-block of A / Aqk.
+    #
+    # Original form: a runtime-bounded `for j in range(min(BC, ...))`
+    # vector loop, computing one column of (A, Aqk) per iteration via
+    # `tl.sum(... * ..., axis=1)` and storing 1-D slices. With BC=32
+    # that is 32 vector-reduce passes + 32 single-column stores per
+    # program, while the cube unit sits idle.
+    #
+    # Rewrite: one (BC, BK) x (BK, BC) -> (BC, BC) cube dot for both
+    # A and Aqk, then triangular mask + single (BC, BC) store. Math
+    # equivalence comes from the same anchor split used in the inter
+    # kernel — for the diagonal block, i-side and j-side share the
+    # same K/g block so no extra DMA is needed:
+    #
+    #     exp(g[i,k] - g[j,k]) = exp(g[i,k] - gn[k]) * exp(gn[k] - g[j,k])
+    #                          = exp_i[i,k] * exp_j[j,k]
+    #
+    # where gn is the anchor row (top of the diagonal block). Two
+    # `exp` calls on (BC, BK) tiles replace BC scalar `exp` calls on
+    # (BK,) tiles. β is kept off `b_k` and applied as a row-vector
+    # broadcast on the (BC, BC) result so that the same `b_k` block
+    # serves both i-side (with exp_i) and j-side (with exp_j).
     i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -724,58 +746,77 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     if i_t * BT + i_i * BC >= T:
         return
 
+    row_anchor = i_t * BT + i_i * BC
     o_i = tl.arange(0, BC)
+    o_j = tl.arange(0, BC)
     o_k = tl.arange(0, BK)
     m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + o_i) < T
-    o_A = (bos + i_t * BT + i_i * BC + o_i) * H * BT + i_h * BT + i_i * BC
+    m_row = (row_anchor + o_i) < T
+    m_col = (row_anchor + o_j) < T
+
+    q_base = q + (bos * H + i_h) * K
+    k_base = k + (bos * H + i_h) * K
+    g_base = g + (bos * H + i_h) * K
 
     p_q = tl.make_block_ptr(
-        q + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
+        q_base, (T, K), (H * K, 1),
+        (row_anchor, 0), (BC, BK), (1, 0),
     )
     p_k = tl.make_block_ptr(
-        k + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
+        k_base, (T, K), (H * K, 1),
+        (row_anchor, 0), (BC, BK), (1, 0),
     )
     p_g = tl.make_block_ptr(
-        g + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
+        g_base, (T, K), (H * K, 1),
+        (row_anchor, 0), (BC, BK), (1, 0),
     )
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
     b_g = tl.load(p_g, boundary_check=(0, 1))
 
-    p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
-    b_k = b_k * tl.load(p_b, mask=m_A, other=0)[:, None]
+    p_b = beta + (bos + row_anchor + o_i) * H + i_h
+    b_b = tl.load(p_b, mask=m_row, other=0)
 
-    p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
-    p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
+    # Anchor row of the diagonal block (single contiguous BK read).
+    b_gn = tl.load(
+        g_base + row_anchor * H * K + o_k,
+        mask=m_k, other=0,
+    )
 
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-        b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_ktg = b_kt[None, :] * exp(b_g - b_gk[None, :])
-        b_A = tl.sum(b_k * b_ktg, 1)
-        b_A = tl.where(o_i > j, b_A, 0.0)
-        b_Aqk = tl.sum(b_q * b_ktg, 1)
-        b_Aqk = tl.where(o_i >= j, b_Aqk * scale, 0.0)
-        tl.store(A + o_A + j, b_A, mask=m_A)
-        tl.store(Aqk + o_A + j, b_Aqk, mask=m_A)
-        p_kt += H * K
-        p_gk += H * K
+    # i-side and j-side anchor decays. j-side uses the same b_g
+    # because the diagonal block is symmetric in source data.
+    exp_i = exp(b_g - b_gn[None, :])              # (BC, BK)
+    exp_j = exp(b_gn[None, :] - b_g)              # (BC, BK)
+
+    b_q_dec = b_q * exp_i * scale                 # (BC, BK)
+    b_k_dec = b_k * exp_i                         # (BC, BK)  no β yet
+    b_kj_dec = b_k * exp_j                        # (BC, BK)  j-side, raw k
+    b_kjT = tl.trans(b_kj_dec)                    # (BK, BC)
+
+    A_pre = tl.dot(b_k_dec, b_kjT)                # (BC, BC)
+    Aqk_pre = tl.dot(b_q_dec, b_kjT)              # (BC, BC)
+
+    # β is row-broadcast onto A only; Aqk is unscaled by β.
+    A_pre = A_pre * b_b[:, None]
+
+    # Diagonal-block triangle masks. A is strict lower (o_i > o_j),
+    # Aqk includes the diagonal (o_i >= o_j). Row/col bounds drop
+    # entries past the chunk's valid length.
+    mask_strict = (o_i[:, None] > o_j[None, :]) & m_row[:, None] & m_col[None, :]
+    mask_lower = (o_i[:, None] >= o_j[None, :]) & m_row[:, None] & m_col[None, :]
+    b_A = tl.where(mask_strict, A_pre, 0.0)
+    b_Aqk = tl.where(mask_lower, Aqk_pre, 0.0)
+
+    p_A = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
+        (row_anchor, i_i * BC), (BC, BC), (1, 0),
+    )
+    p_Aqk = tl.make_block_ptr(
+        Aqk + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
+        (row_anchor, i_i * BC), (BC, BC), (1, 0),
+    )
+    tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
