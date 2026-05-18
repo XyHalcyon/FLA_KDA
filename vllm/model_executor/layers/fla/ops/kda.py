@@ -858,49 +858,50 @@ def chunk_kda_scaled_dot_kkt_fwd(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    # Tile sub-block size. Original FLA value is 16 (GPU-friendly with
-    # warp-level 16x16x16 tensor cores). On Ascend the inter kernel is
-    # scalar-bound (profile: 55% scalar, 1.7% cube), and the dominant
-    # scalar source is the unrolled (NC-1)*NC/2 triangle of
-    # make_block_ptr / mask / trans / dot / store sequences inside one
-    # program. Doubling BC to 32 collapses NC from 4 to 2, so the inter
-    # kernel walks one (i_i=1, i_j=0) pair per chunk instead of six
-    # pairs — scalar work / chunk drops ~6x while cube work drops ~1.5x
-    # (BC=32 dot is closer to a square so off-diagonal waste shrinks).
-    # The intra kernel's per-program work doubles but its program count
-    # halves (NC=2 instead of 4), so its total cost is roughly flat.
-    # Cube tile (32, 128) * (128, 32) decomposes into 2*2*8 = 32 16x16x16
-    # micro-MACs — natural fit for the Ascend cube unit.
-    BC = min(32, BT)
+    # Tile sub-block size. Evolution on Ascend:
+    #   BC=16 (FLA original):  NC=4, inter scalar-bound (6 i_j pairs per
+    #                          chunk), intra vector-bound.
+    #   BC=32 (round 1):       NC=2, inter pairs collapse to 1, gave 2.4x.
+    #                          Intra rewritten to integer-block cube dot.
+    #   BC=64 (this round):    NC=1. Two compounding effects:
+    #     1) Inter kernel has zero work (no i_j < i_i pairs exist) and
+    #        is skipped entirely on the host side — saves ~2.6ms.
+    #     2) Intra per-program cube tile grows from (32,128)*(128,32)
+    #        to (64,128)*(128,64), program count halves, scalar setup
+    #        cost amortized over 4x more cube MACs.
+    # UB headroom (910C): BC=64 with K=128 fp16 brings peak live tensor
+    # set close to ~190KB before triton's liveness analysis. If the
+    # ascend backend reports UB overflow, fall back to BC=32 and cast
+    # exp_i/exp_j to fp16 inside the intra kernel as a recovery path.
+    BC = min(64, BT)
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
     Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
-    # NPU: one program per (chunk, head). Earlier (NT, NC, B*H) grid
-    # multiplied program count by NC and shrank per-program work below
-    # what the AI Core scheduler can absorb; the inter kernel now walks
-    # i_i internally with all i-side loads hoisted out of the j loop.
-    # BK is pinned to next_power_of_2(K) so the i_k loop collapses to
-    # one tile in the K=128 case (matching the intra kernel).
-    grid = (NT, B * H)
-    chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        A=A,
-        Aqk=Aqk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-        BK=BK,
-        NC=NC,
-    )
+    # Inter kernel is only meaningful when NC > 1: it computes the
+    # off-diagonal sub-blocks of the BT x BT KKt block, indexed by
+    # (i_i, i_j) with 0 <= i_j < i_i < NC. With NC=1 the (i_i, i_j)
+    # set is empty, so skip the launch entirely.
+    if NC > 1:
+        grid = (NT, B * H)
+        chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            A=A,
+            Aqk=Aqk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+            BK=BK,
+            NC=NC,
+        )
 
     grid = (NT, NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
