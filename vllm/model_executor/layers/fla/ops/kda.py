@@ -817,7 +817,20 @@ def chunk_kda_scaled_dot_kkt_fwd(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BC = min(16, BT)
+    # Tile sub-block size. Original FLA value is 16 (GPU-friendly with
+    # warp-level 16x16x16 tensor cores). On Ascend the inter kernel is
+    # scalar-bound (profile: 55% scalar, 1.7% cube), and the dominant
+    # scalar source is the unrolled (NC-1)*NC/2 triangle of
+    # make_block_ptr / mask / trans / dot / store sequences inside one
+    # program. Doubling BC to 32 collapses NC from 4 to 2, so the inter
+    # kernel walks one (i_i=1, i_j=0) pair per chunk instead of six
+    # pairs — scalar work / chunk drops ~6x while cube work drops ~1.5x
+    # (BC=32 dot is closer to a square so off-diagonal waste shrinks).
+    # The intra kernel's per-program work doubles but its program count
+    # halves (NC=2 instead of 4), so its total cost is roughly flat.
+    # Cube tile (32, 128) * (128, 32) decomposes into 2*2*8 = 32 16x16x16
+    # micro-MACs — natural fit for the Ascend cube unit.
+    BC = min(32, BT)
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
