@@ -835,58 +835,62 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     # derived b_q_dec / b_k_dec. Only j-side data for sub-block i_j
     # (rows i_t*BT + i_j*BC..+BC) needs new DMA.
     #
-    # When BC=32, NC=2 the loop body executes once for i_i=1 (i_j=0)
-    # and is skipped for i_i=0. With BC=16, NC=4 it would handle the
-    # full triangle (1 / 2 / 3 pairs for i_i = 1 / 2 / 3 respectively).
-    # `range(0, i_i)` is a triton runtime loop here because i_i is a
-    # program_id, not a constexpr — but i_i is bounded by NC which is
-    # known at JIT time, so the body is still amenable to scheduling.
-    if i_i > 0:
-        for i_j in range(0, i_i):
-            j_anchor = i_t * BT + i_j * BC
-            m_col_j = (j_anchor + o_j) < T
+    # NOTE on shape: the original implementation used a runtime loop
+    # `for i_j in range(0, i_i)` to handle the general NC > 2 case.
+    # On triton-ascend the BiSheng compilation pipeline failed on that
+    # form with `cc -> cbuf` errors — apparently its cube buffer alias
+    # analysis mis-tracks `b_kjT_inter` when two consecutive dots
+    # share the right operand inside a runtime loop. The straight-line
+    # form below (matching the diagonal-block code shape that compiles
+    # cleanly) sidesteps that path. This restricts merge support to
+    # NC <= 2 (BC >= BT/2); BC=32, BT=64 → NC=2, which is the proven
+    # configuration. If NC > 2 is ever needed, generalize by unrolling
+    # the i_j cases the same way.
+    if i_i == 1:
+        j_anchor = i_t * BT  # i_j = 0
+        m_col_j = (j_anchor + o_j) < T
 
-            p_kj = tl.make_block_ptr(
-                k_base, (T, K), (H * K, 1),
-                (j_anchor, 0), (BC, BK), (1, 0),
-            )
-            p_gj = tl.make_block_ptr(
-                g_base, (T, K), (H * K, 1),
-                (j_anchor, 0), (BC, BK), (1, 0),
-            )
-            b_kj_inter = tl.load(p_kj, boundary_check=(0, 1))
-            b_gj_inter = tl.load(p_gj, boundary_check=(0, 1))
+        p_kj = tl.make_block_ptr(
+            k_base, (T, K), (H * K, 1),
+            (j_anchor, 0), (BC, BK), (1, 0),
+        )
+        p_gj = tl.make_block_ptr(
+            g_base, (T, K), (H * K, 1),
+            (j_anchor, 0), (BC, BK), (1, 0),
+        )
+        b_kj_inter = tl.load(p_kj, boundary_check=(0, 1))
+        b_gj_inter = tl.load(p_gj, boundary_check=(0, 1))
 
-            # j-side decay relative to i_i's anchor (b_gn). Same
-            # algebraic form as exp_j inside the diagonal block, only
-            # the j-rows differ.
-            exp_j_inter = exp(b_gn[None, :] - b_gj_inter)        # (BC, BK)  fp32
-            b_kj_inter_dec = b_kj_inter * exp_j_inter             # (BC, BK)  fp32
-            b_kjT_inter = tl.trans(b_kj_inter_dec)                # (BK, BC)  fp32
+        # j-side decay relative to i_i's anchor (b_gn). Same algebraic
+        # form as exp_j inside the diagonal block, only the j-rows
+        # differ.
+        exp_j_inter = exp(b_gn[None, :] - b_gj_inter)        # (BC, BK)  fp32
+        b_kj_inter_dec = b_kj_inter * exp_j_inter             # (BC, BK)  fp32
+        b_kjT_inter = tl.trans(b_kj_inter_dec)                # (BK, BC)  fp32
 
-            # b_k_dec / b_q_dec from above are reused as-is.
-            A_inter = tl.dot(b_k_dec, b_kjT_inter)                # (BC, BC)  fp32
-            Aqk_inter = tl.dot(b_q_dec, b_kjT_inter)              # (BC, BC)  fp32
+        # b_k_dec / b_q_dec from above are reused as-is.
+        A_inter = tl.dot(b_k_dec, b_kjT_inter)                # (BC, BC)  fp32
+        Aqk_inter = tl.dot(b_q_dec, b_kjT_inter)              # (BC, BC)  fp32
 
-            # Inter blocks are strictly off-diagonal (i_j < i_i), so
-            # there is no triangular mask — only row/col bounds.
-            A_inter = A_inter * b_b[:, None]
-            mask_inter = m_row[:, None] & m_col_j[None, :]
-            b_A_inter = tl.where(mask_inter, A_inter, 0.0)
-            b_Aqk_inter = tl.where(mask_inter, Aqk_inter, 0.0)
+        # Inter blocks are strictly off-diagonal (i_j < i_i), so there
+        # is no triangular mask — only row/col bounds.
+        A_inter = A_inter * b_b[:, None]
+        mask_inter = m_row[:, None] & m_col_j[None, :]
+        b_A_inter = tl.where(mask_inter, A_inter, 0.0)
+        b_Aqk_inter = tl.where(mask_inter, Aqk_inter, 0.0)
 
-            p_A_inter = tl.make_block_ptr(
-                A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-                (row_anchor, i_j * BC), (BC, BC), (1, 0),
-            )
-            p_Aqk_inter = tl.make_block_ptr(
-                Aqk + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-                (row_anchor, i_j * BC), (BC, BC), (1, 0),
-            )
-            tl.store(p_A_inter, b_A_inter.to(A.dtype.element_ty),
-                     boundary_check=(0, 1))
-            tl.store(p_Aqk_inter, b_Aqk_inter.to(Aqk.dtype.element_ty),
-                     boundary_check=(0, 1))
+        p_A_inter = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
+            (row_anchor, 0), (BC, BC), (1, 0),
+        )
+        p_Aqk_inter = tl.make_block_ptr(
+            Aqk + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
+            (row_anchor, 0), (BC, BC), (1, 0),
+        )
+        tl.store(p_A_inter, b_A_inter.to(A.dtype.element_ty),
+                 boundary_check=(0, 1))
+        tl.store(p_Aqk_inter, b_Aqk_inter.to(Aqk.dtype.element_ty),
+                 boundary_check=(0, 1))
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
