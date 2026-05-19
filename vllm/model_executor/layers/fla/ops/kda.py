@@ -785,16 +785,31 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
 
     # i-side and j-side anchor decays. j-side uses the same b_g
     # because the diagonal block is symmetric in source data.
-    exp_i = exp(b_g - b_gn[None, :])              # (BC, BK)
-    exp_j = exp(b_gn[None, :] - b_g)              # (BC, BK)
+    exp_i = exp(b_g - b_gn[None, :])              # (BC, BK)  fp32
+    exp_j = exp(b_gn[None, :] - b_g)              # (BC, BK)  fp32
 
-    b_q_dec = b_q * exp_i * scale                 # (BC, BK)
-    b_k_dec = b_k * exp_i                         # (BC, BK)  no β yet
-    b_kj_dec = b_k * exp_j                        # (BC, BK)  j-side, raw k
-    b_kjT = tl.trans(b_kj_dec)                    # (BK, BC)
+    b_q_dec = b_q * exp_i * scale                 # (BC, BK)  fp32
+    b_k_dec = b_k * exp_i                         # (BC, BK)  fp32, no β yet
+    b_kj_dec = b_k * exp_j                        # (BC, BK)  fp32, j-side
+    b_kjT = tl.trans(b_kj_dec)                    # (BK, BC)  fp32
 
-    A_pre = tl.dot(b_k_dec, b_kjT)                # (BC, BC)
-    Aqk_pre = tl.dot(b_q_dec, b_kjT)              # (BC, BC)
+    # Cast dot operands back to input dtype (fp16/bf16) so the Ascend
+    # cube unit takes the native fma path. exp_* keeps fp32 precision
+    # up to this point; out_dtype=fp32 preserves accumulator precision.
+    # Without this cast, fp32 x fp32 dot can fall back to a vector
+    # emulation path on triton-ascend, which is what the round-2 BC=64
+    # profile suggested (cube_ratio < 1%, AIV scalar dominant).
+    in_dtype = q.dtype.element_ty
+    A_pre = tl.dot(
+        b_k_dec.to(in_dtype),
+        b_kjT.to(in_dtype),
+        out_dtype=tl.float32,
+    )                                             # (BC, BC)  fp32
+    Aqk_pre = tl.dot(
+        b_q_dec.to(in_dtype),
+        b_kjT.to(in_dtype),
+        out_dtype=tl.float32,
+    )                                             # (BC, BC)  fp32
 
     # β is row-broadcast onto A only; Aqk is unscaled by β.
     A_pre = A_pre * b_b[:, None]
@@ -863,17 +878,12 @@ def chunk_kda_scaled_dot_kkt_fwd(
     #                          chunk), intra vector-bound.
     #   BC=32 (round 1):       NC=2, inter pairs collapse to 1, gave 2.4x.
     #                          Intra rewritten to integer-block cube dot.
-    #   BC=64 (this round):    NC=1. Two compounding effects:
-    #     1) Inter kernel has zero work (no i_j < i_i pairs exist) and
-    #        is skipped entirely on the host side — saves ~2.6ms.
-    #     2) Intra per-program cube tile grows from (32,128)*(128,32)
-    #        to (64,128)*(128,64), program count halves, scalar setup
-    #        cost amortized over 4x more cube MACs.
-    # UB headroom (910C): BC=64 with K=128 fp16 brings peak live tensor
-    # set close to ~190KB before triton's liveness analysis. If the
-    # ascend backend reports UB overflow, fall back to BC=32 and cast
-    # exp_i/exp_j to fp16 inside the intra kernel as a recovery path.
-    BC = min(64, BT)
+    #   BC=64 (rejected):      NC=1, inter skipped; but intra per-program
+    #                          AIV scalar exploded 38us -> 128us (3.4x),
+    #                          most likely from UB pressure pushing
+    #                          intermediates to spill. Net +51% time.
+    # Back at BC=32 as the proven sweet spot.
+    BC = min(32, BT)
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
