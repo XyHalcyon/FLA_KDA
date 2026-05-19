@@ -793,23 +793,16 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     b_kj_dec = b_k * exp_j                        # (BC, BK)  fp32, j-side
     b_kjT = tl.trans(b_kj_dec)                    # (BK, BC)  fp32
 
-    # Cast dot operands back to input dtype (fp16/bf16) so the Ascend
-    # cube unit takes the native fma path. exp_* keeps fp32 precision
-    # up to this point; out_dtype=fp32 preserves accumulator precision.
-    # Without this cast, fp32 x fp32 dot can fall back to a vector
-    # emulation path on triton-ascend, which is what the round-2 BC=64
-    # profile suggested (cube_ratio < 1%, AIV scalar dominant).
-    in_dtype = q.dtype.element_ty
-    A_pre = tl.dot(
-        b_k_dec.to(in_dtype),
-        b_kjT.to(in_dtype),
-        out_dtype=tl.float32,
-    )                                             # (BC, BC)  fp32
-    Aqk_pre = tl.dot(
-        b_q_dec.to(in_dtype),
-        b_kjT.to(in_dtype),
-        out_dtype=tl.float32,
-    )                                             # (BC, BC)  fp32
+    # Note: dot inputs are kept fp32. An earlier attempt cast operands
+    # back to the input dtype (fp16/bf16) hoping to route the cube unit
+    # to its native fma path, but that produced NaN — `exp(b_g - b_gn)`
+    # values can exceed fp16 max (~65504) when `b_g` accumulates large
+    # negative spans, so casting fp32 -> fp16 turns finite intermediates
+    # into inf, then dot accumulates inf -> NaN. The dynamic range of
+    # the KDA decay factor is intrinsic to the algorithm, so the
+    # operands must stay fp32 here.
+    A_pre = tl.dot(b_k_dec, b_kjT)                # (BC, BC)  fp32
+    Aqk_pre = tl.dot(b_q_dec, b_kjT)              # (BC, BC)  fp32
 
     # β is row-broadcast onto A only; Aqk is unscaled by β.
     A_pre = A_pre * b_b[:, None]
