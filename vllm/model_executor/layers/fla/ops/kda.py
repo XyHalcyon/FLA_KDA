@@ -826,81 +826,6 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
-    # ---- merged inter pairs: (i_i, 0..i_i-1) -------------------------
-    # The standalone inter kernel computed off-diagonal sub-blocks
-    # (i_i, i_j) with 0 <= i_j < i_i. β-strategy folds that work into
-    # this intra program for the same i_i, reusing the already-loaded
-    # i-side data: b_q/b_k/b_g (rows row_anchor..row_anchor+BC),
-    # b_gn (anchor row at row_anchor), b_b (β for i rows), and the
-    # derived b_q_dec / b_k_dec. Only j-side data for sub-block i_j
-    # (rows i_t*BT + i_j*BC..+BC) needs new DMA.
-    #
-    # NOTE on shape: the original implementation used a runtime loop
-    # `for i_j in range(0, i_i)` to handle the general NC > 2 case.
-    # On triton-ascend the BiSheng compilation pipeline failed on that
-    # form with `cc -> cbuf` errors — apparently its cube buffer alias
-    # analysis mis-tracks `b_kjT_inter` when two consecutive dots
-    # share the right operand inside a runtime loop. The straight-line
-    # form below (matching the diagonal-block code shape that compiles
-    # cleanly) sidesteps that path. This restricts merge support to
-    # NC <= 2 (BC >= BT/2); BC=32, BT=64 → NC=2, which is the proven
-    # configuration. If NC > 2 is ever needed, generalize by unrolling
-    # the i_j cases the same way.
-    if i_i == 1:
-        j_anchor = i_t * BT  # i_j = 0
-        m_col_j = (j_anchor + o_j) < T
-        mask_inter = m_row[:, None] & m_col_j[None, :]
-
-        p_kj = tl.make_block_ptr(
-            k_base, (T, K), (H * K, 1),
-            (j_anchor, 0), (BC, BK), (1, 0),
-        )
-        p_gj = tl.make_block_ptr(
-            g_base, (T, K), (H * K, 1),
-            (j_anchor, 0), (BC, BK), (1, 0),
-        )
-        b_kj_inter = tl.load(p_kj, boundary_check=(0, 1))
-        b_gj_inter = tl.load(p_gj, boundary_check=(0, 1))
-
-        # j-side decay relative to i_i's anchor (b_gn). Same algebraic
-        # form as exp_j inside the diagonal block, only the j-rows
-        # differ.
-        exp_j_inter = exp(b_gn[None, :] - b_gj_inter)        # (BC, BK)  fp32
-        b_kj_inter_dec = b_kj_inter * exp_j_inter             # (BC, BK)  fp32
-        b_kjT_inter = tl.trans(b_kj_inter_dec)                # (BK, BC)  fp32
-
-        # NOTE on dot scheduling: an earlier form had two consecutive
-        # `tl.dot(b_*_dec, b_kjT_inter)` followed by post-processing
-        # and stores. The triton-ascend BiSheng pipeline failed that
-        # form with `cc -> cbuf` errors — the cube C buffer alias
-        # analysis cannot place two cc allocations inside an `if`
-        # branch when both are kept live until the where/store. We
-        # interleave dot -> post -> store for each output so that
-        # each cc allocation is short-lived (dot result is consumed
-        # and stored before the next dot starts), matching the cube
-        # buffer reuse pattern the compiler can handle.
-
-        # ---- A side: dot, β scale, mask, store --------------------
-        A_inter = tl.dot(b_k_dec, b_kjT_inter)                # (BC, BC)  fp32
-        A_inter = A_inter * b_b[:, None]
-        b_A_inter = tl.where(mask_inter, A_inter, 0.0)
-        p_A_inter = tl.make_block_ptr(
-            A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-            (row_anchor, 0), (BC, BC), (1, 0),
-        )
-        tl.store(p_A_inter, b_A_inter.to(A.dtype.element_ty),
-                 boundary_check=(0, 1))
-
-        # ---- Aqk side: dot, mask, store ---------------------------
-        Aqk_inter = tl.dot(b_q_dec, b_kjT_inter)              # (BC, BC)  fp32
-        b_Aqk_inter = tl.where(mask_inter, Aqk_inter, 0.0)
-        p_Aqk_inter = tl.make_block_ptr(
-            Aqk + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-            (row_anchor, 0), (BC, BC), (1, 0),
-        )
-        tl.store(p_Aqk_inter, b_Aqk_inter.to(Aqk.dtype.element_ty),
-                 boundary_check=(0, 1))
-
 
 def chunk_kda_scaled_dot_kkt_fwd(
     q: torch.Tensor,
@@ -956,17 +881,32 @@ def chunk_kda_scaled_dot_kkt_fwd(
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
     Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
-    # Inter work (off-diagonal sub-blocks (i_i, i_j) with i_j < i_i)
-    # is folded into the intra kernel — see the merged-inter loop in
-    # chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra. The intra
-    # program for sub-block i_i already has b_q/b_k/b_g/b_gn/b_b/
-    # b_q_dec/b_k_dec live in UB, so handling the inter (i_i, *) row
-    # only adds j-side DMA + dot + store — no duplicate launch, no
-    # duplicate i-side DMA, no duplicate setup.
-    #
-    # The standalone chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter
-    # definition is intentionally retained above as a rollback target;
-    # it is no longer launched from host.
+    # Inter kernel handles off-diagonal sub-blocks (i_i, i_j) with
+    # 0 <= i_j < i_i < NC. With NC=1 there are no such pairs, so the
+    # launch is skipped. (A round of optimization tried folding the
+    # inter work into intra; the merged form failed to compile on
+    # triton-ascend with `cc -> cbuf` errors that no straight-line
+    # rewrite resolved, so the two-kernel form is kept.)
+    if NC > 1:
+        grid = (NT, B * H)
+        chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            A=A,
+            Aqk=Aqk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+            BK=BK,
+            NC=NC,
+        )
 
     grid = (NT, NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
