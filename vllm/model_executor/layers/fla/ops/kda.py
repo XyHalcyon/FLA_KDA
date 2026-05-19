@@ -849,6 +849,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     if i_i == 1:
         j_anchor = i_t * BT  # i_j = 0
         m_col_j = (j_anchor + o_j) < T
+        mask_inter = m_row[:, None] & m_col_j[None, :]
 
         p_kj = tl.make_block_ptr(
             k_base, (T, K), (H * K, 1),
@@ -868,27 +869,35 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         b_kj_inter_dec = b_kj_inter * exp_j_inter             # (BC, BK)  fp32
         b_kjT_inter = tl.trans(b_kj_inter_dec)                # (BK, BC)  fp32
 
-        # b_k_dec / b_q_dec from above are reused as-is.
+        # NOTE on dot scheduling: an earlier form had two consecutive
+        # `tl.dot(b_*_dec, b_kjT_inter)` followed by post-processing
+        # and stores. The triton-ascend BiSheng pipeline failed that
+        # form with `cc -> cbuf` errors — the cube C buffer alias
+        # analysis cannot place two cc allocations inside an `if`
+        # branch when both are kept live until the where/store. We
+        # interleave dot -> post -> store for each output so that
+        # each cc allocation is short-lived (dot result is consumed
+        # and stored before the next dot starts), matching the cube
+        # buffer reuse pattern the compiler can handle.
+
+        # ---- A side: dot, β scale, mask, store --------------------
         A_inter = tl.dot(b_k_dec, b_kjT_inter)                # (BC, BC)  fp32
-        Aqk_inter = tl.dot(b_q_dec, b_kjT_inter)              # (BC, BC)  fp32
-
-        # Inter blocks are strictly off-diagonal (i_j < i_i), so there
-        # is no triangular mask — only row/col bounds.
         A_inter = A_inter * b_b[:, None]
-        mask_inter = m_row[:, None] & m_col_j[None, :]
         b_A_inter = tl.where(mask_inter, A_inter, 0.0)
-        b_Aqk_inter = tl.where(mask_inter, Aqk_inter, 0.0)
-
         p_A_inter = tl.make_block_ptr(
             A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
             (row_anchor, 0), (BC, BC), (1, 0),
         )
+        tl.store(p_A_inter, b_A_inter.to(A.dtype.element_ty),
+                 boundary_check=(0, 1))
+
+        # ---- Aqk side: dot, mask, store ---------------------------
+        Aqk_inter = tl.dot(b_q_dec, b_kjT_inter)              # (BC, BC)  fp32
+        b_Aqk_inter = tl.where(mask_inter, Aqk_inter, 0.0)
         p_Aqk_inter = tl.make_block_ptr(
             Aqk + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
             (row_anchor, 0), (BC, BC), (1, 0),
         )
-        tl.store(p_A_inter, b_A_inter.to(A.dtype.element_ty),
-                 boundary_check=(0, 1))
         tl.store(p_Aqk_inter, b_Aqk_inter.to(Aqk.dtype.element_ty),
                  boundary_check=(0, 1))
 
