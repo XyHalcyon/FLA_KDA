@@ -508,17 +508,19 @@ class FusedRMSNormGated(CustomOp):
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in [32, 64]
-#         for num_warps in [1, 2, 4, 8]
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["BC"],
-# )
+# Autotune sweep over scheduling hints. The cube/vector tile shape
+# (BC, BK) is fixed by the host-kernel protocol, so the only kernel-
+# internal knobs are num_warps and num_stages. NPU semantics for these
+# hints are not formally documented; this sweep lets triton-ascend
+# pick whatever lowering the underlying BiSheng pipeline considers
+# best on this device. Triton caches the choice per key, so the
+# 4x4 first-launch overhead is paid once.
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=4, num_stages=2)],
+    configs=[
+        triton.Config({}, num_warps=nw, num_stages=ns)
+        for nw in [1, 2, 4, 8]
+        for ns in [1, 2, 3, 4]
+    ],
     key=["BC", "BK"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -679,12 +681,13 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-#     key=["BK", "BT"],
-# )
+# See note on the inter kernel above. Same sweep, same rationale.
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=4)],
+    configs=[
+        triton.Config({}, num_warps=nw, num_stages=ns)
+        for nw in [1, 2, 4, 8]
+        for ns in [1, 2, 3, 4]
+    ],
     key=["BK", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
