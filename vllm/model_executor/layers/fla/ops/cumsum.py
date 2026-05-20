@@ -115,12 +115,6 @@ def chunk_local_cumsum_vector_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    o_i = tl.arange(0, BT)
-    if REVERSE:
-        m_s = tl.where(o_i[:, None] <= o_i[None, :], 1.0, 0.0)
-    else:
-        m_s = tl.where(o_i[:, None] >= o_i[None, :], 1.0, 0.0)
-
     if HEAD_FIRST:
         p_s = tl.make_block_ptr(
             s + (bos * H + i_h * T) * S,
@@ -157,7 +151,10 @@ def chunk_local_cumsum_vector_kernel(
         )
     # [BT, BS]
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    b_o = tl.dot(m_s, b_s, allow_tf32=False)
+    b_o = tl.cumsum(b_s, axis=0)
+    if REVERSE:
+        b_z = tl.sum(b_s, axis=0)
+        b_o = -b_o + b_z[None, :] + b_s
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
