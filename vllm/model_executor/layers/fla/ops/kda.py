@@ -508,19 +508,14 @@ class FusedRMSNormGated(CustomOp):
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# Autotune sweep over scheduling hints. The cube/vector tile shape
-# (BC, BK) is fixed by the host-kernel protocol, so the only kernel-
-# internal knobs are num_warps and num_stages. NPU semantics for these
-# hints are not formally documented; this sweep lets triton-ascend
-# pick whatever lowering the underlying BiSheng pipeline considers
-# best on this device. Triton caches the choice per key, so the
-# 4x4 first-launch overhead is paid once.
+# num_warps=1, num_stages=1 picked by triton autotune sweep on Ascend
+# 910C over num_warps in {1,2,4,8} x num_stages in {1,2,3,4}, key
+# (BC=32, BK=128) on the 8192-token cu_seqlens scenario. The inter
+# program is small (one i_j=0 pair after the BC=32 collapse), so
+# software pipelining (stages > 1) has no iterations to overlap and
+# extra warps only add scheduling overhead.
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [1, 2, 4, 8]
-        for ns in [1, 2, 3, 4]
-    ],
+    configs=[triton.Config({}, num_warps=1, num_stages=1)],
     key=["BC", "BK"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -681,13 +676,13 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# See note on the inter kernel above. Same sweep, same rationale.
+# num_warps=1, num_stages=4 picked by triton autotune sweep on Ascend
+# 910C (same sweep as the inter kernel above). The intra program has
+# enough sequential work — exp_i / exp_j computation, two cube dots,
+# triangular mask, single (BC, BC) store — for stages=4 multi-buffering
+# to overlap MTE / cube / vector pipes effectively.
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [1, 2, 4, 8]
-        for ns in [1, 2, 3, 4]
-    ],
+    configs=[triton.Config({}, num_warps=1, num_stages=4)],
     key=["BK", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
