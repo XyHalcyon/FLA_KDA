@@ -463,3 +463,53 @@ for i in range(2, min(16, T_local)):                # 共享同一个 i ∈ [2, 
 | ----------------------------------- | ------ | ------ | ------ | ------ | ------ | ------ |
 |                                     | 优化前 | 优化后 | 提升   | 优化前 | 优化后 | 提升   |
 | merge_16x16_to_64x64_inverse_kernel | 714    | 536    | 24.93% | 5317   | 4101   | 22.87% |
+
+## 五、chunk_gated_delta_rule_fwd_kernel_h_blockdim64性能优化点
+
+`chunk_gated_delta_rule_fwd_kernel_h_blockdim64` 沿 T 方向递推 KV 状态 `h`：每个 (i_t, i_b, i_h) program 顺序处理 NT 个 chunk，对每个 chunk 读 `(k, w, u/g/gk)`、累乘衰减、再 dot 出新 `h`。kernel 体本身是个紧凑递推，性能瓶颈在两侧：单 program 的循环体重不重，以及 grid 一次能不能把核心吃满。
+
+**问题（base 的浪费点）：**
+
+1. **autotune 网格虚胖**：base 配 `BV ∈ {32, 64} × num_warps ∈ {2, 4} × num_stages ∈ {2, 3, 4}` 共 12 组 config，且最大 BV=64。
+2. **BV=64 在 V=128 形状下产生冗余 i_v 程序**：grid `(cdiv(V, BV), N*H)`，V=128 / BV=64 → `i_v` 维度 = 2，每个 (i_t, i_b, i_h) 在 V 方向上要跑两个 program，递推体被重复一份。
+3. **wave 数被 grid 推高**：N=1, H=32, NV=2 → 64 个 program，24 AIC 核 → 2.67 wave；每轮 wave 都要付一次 program 启动税（参见 [[gla_fwd_o]] 上 ~62 us / wave 的同源开销）。
+
+本次只做一件事：
+
+### 方向 1：autotune 收敛到 `BV=128, num_warps=4, num_stages=3`
+
+把 12 组 config 收成单点。要点是**扩展 BV 取值** —— main 的 `BV ∈ {32, 64}` 都覆盖不了 V=128 的全长，autotune 在这个网格里再怎么挑都会留下 `i_v` 维度 ≥ 2 的冗余 program。新配置直接把 BV 提到 128，让 `cdiv(V, BV) = 1`：
+
+- grid 第 0 维（i_v）从 2 塌缩成 1，program 数 64 → 32（÷2）；
+- wave 数 2.67 → 1.33；启动税被分母吃掉一半；
+- kernel 体里所有按 `i_v` 翻倍的 `make_block_ptr`、boundary check 全部消失。
+
+`num_warps=4, num_stages=3` 是这一支在 (4, 8) × (2, 3, 4) 网格上反复 sweep 后的 converged 选择，参见 [[kda-bottleneck-overview]]。
+
+**这一招生效的前提：** V=128 是当前实际跑的 head_dim；如果上游传更大的 V，BV=128 会让 i_v 重新拆出多个程序，应当回退到原 autotune 网格让其重新选。
+
+
+
+### 具体代码修改点（main → 当前）
+
+```python
+@@ chunk_gated_delta_rule_fwd_kernel_h_blockdim64 @@
+ @triton.autotune(
+-    configs=[
+-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+-        for num_warps in [2, 4]
+-        for num_stages in [2, 3, 4]
+-        for BV in [32, 64]                                      # 都 < V=128
+-    ],
++    configs=[triton.Config({"BV": 128}, num_warps=4, num_stages=3)],
+     key=["H", "K", "V", "BT"],
+     use_cuda_graph=use_cuda_graph,
+ )
+```
+
+### 性能数据
+
+| 算子                                           | 1K(us) |        |        | 8K(us) |        |        |
+| ---------------------------------------------- | ------ | ------ | ------ | ------ | ------ | ------ |
+|                                                | 优化前 | 优化后 | 提升   | 优化前 | 优化后 | 提升   |
+| chunk_gated_delta_rule_fwd_kernel_h_blockdim64 | 446    | 306    | 31.39% | 3323   | 2333   | 29.79% |
