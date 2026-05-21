@@ -62,16 +62,16 @@
 - 基线网格 `(NV=1, NT=16, B*H=32) = 512` program × 24 个 AIC 核 ≈ **21 轮 wave**，每轮都要付一次启动税；
 - 同时 autotune 默认开了 24 组 `BK×BV×nw×ns` 配置，K=V=128 下小 BK/BV 让 `i_k`/`i_v` 退化成无意义的多步循环，循环体里还残留 `if i_k >= 0:` 和 NPU 上无效的 `allow_tf32=False`。
 
-本次共做四件事：
+**优化策略：**
 
-### 方向 1：把 K 维循环拍扁为单步（含死代码清理）
+##### 方向 1：把 K 维循环拍扁为单步（含死代码清理）
 
 原代码在 K 维度上分块循环：默认 `BK=64`、`K=128`，每个 program 要跑 2 次 `i_k` 循环，每次只覆盖一半 K 数据，附带的 `make_block_ptr`、地址偏移、`boundary_check` 全部翻倍。同时循环体里还有 `if i_k >= 0:` 这种永远为真的判断（`i_k` 从 0 起步），triton-ascend lowering 仍会为它生成一段冗余的控制流。
 
 **改法：** autotune 配置直接固化为 `BK=128, BV=128, num_warps=2, num_stages=4`，让 `i_k`、`i_v` 都塌缩成单步；同时删掉 `if i_k >= 0:`。
 
 
-### 方向 3：H_PACK —— 一个 program 干 8 个 head 的活（最关键一招）
+##### 方向 2：H_PACK —— 一个 program 干 8 个 head 的活（最关键一招）
 
 这是收益最大的一招，直接对准启动税。
 
@@ -90,7 +90,7 @@
 - 总耗时：1344 us → **3 × 82 ≈ 246 us**，和实测 **248 us** 对得上。
 
 
-### 当前实现（kda.py:1048-1168, 1192-1215）
+##### 当前实现（kda.py:1048-1168, 1192-1215）
 
 ```python
 @triton.autotune(
@@ -133,7 +133,7 @@ def chunk_gla_fwd_o_gk(...):
     chunk_gla_fwd_kernel_o[grid](..., H_PACK=H_PACK)
 ```
 
-### 具体代码修改点
+##### 具体代码修改点
 
 ```python
 @@ -1006,13 +1047,7 @@ def recompute_w_u_fwd(
@@ -200,7 +200,7 @@ def chunk_gla_fwd_o_gk(...):
      )
 ```
 
-### 性能数据
+##### 性能数据
 
 测试 case：`(B=1, T=1024, H=32, K=128, V=128, fp16)`，对应 `H_PACK=8`，program 网格从 `(1, 16, 32)` 收缩到 `(1, 16, 4)`，wave 数从 21 降到 3。
 
@@ -211,3 +211,120 @@ def chunk_gla_fwd_o_gk(...):
 
 > 单 program 时间多干 8× 工作只涨 27%，是这次优化生效的直接证据：多出来的 7 份 head 几乎"白送"，因为它们共享了同一笔 ~62 us 的启动税。
 
+
+
+## 三、chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter性能优化点
+
+**问题：** `intra_sub_inter` 算的是 chunk 内 *非对角*（`i_i > i_j`）的 BC×BC 子块，输出 `A` 与 `Aqk`。三笔可量化的浪费：
+
+1. **i_k 内层循环白跑**：base 的 `BK=64`、`K=128`，每个 (i_i, i_j) 对都跑两轮 `for i_k in range(tl.cdiv(K, BK))`，每轮覆盖一半 K，附带 5 个 `make_block_ptr`、若干 `boundary_check` 全部翻倍。
+2. **i_i-only 的载入仍困在 i_j 循环里**：`b_q / b_k / b_g / b_gn`、`exp(b_g - b_gn)` 这些只跟 i_i 有关的量，位于 `for i_j` 之内。NC=4 的真实形状下 (i_i=1..3, i_j=0..i_i-1) 共 6 个内层迭代，i_i=2/3 的载入分别被重复 2/3 次，MTE2 上有明显冗余。
+3. **`b_A *= b_b[:, None]` 是一笔多余的 vec pass**：在累加完 `b_A += tl.dot(...)` 后再单独乘 beta，相当于一次额外的 `BC×BC` 元素遍历。
+
+**优化策略：**
+
+##### 方向 1：BK = next_power_of_2(K)，i_k 循环塌缩为单步
+
+默认 `triton.Config({"BK": 64}, num_warps=4, num_stages=2)`，优化后 把这层 autotune 干掉，wrapper 显式传 `BK = max(next_power_of_2(K), 16)`，并在 kernel 入口加 `tl.static_assert(BK >= K)`，让 K 维一次性盖完。
+
+`for i_k in range(tl.cdiv(K, BK))` 在 K=128、BK=128 下塌缩成单步，连带 i_k 相关的 `o_k = i_k * BK + tl.arange(0, BK)` 退化成纯 `tl.arange(0, BK)`、`make_block_ptr` 数量减半。
+
+##### 方向 2：把 i_i-only 的载入 hoist 到 i_j 循环外（最关键一招）
+
+代码结构虽然是 `for i_i / for i_j`，但 i_i-only 数据没提到外层。优化后直接挪：
+
+- 提出来的：`p_q / p_k / p_g`（q/k/g 在 i_i 处的 BC×BK 块）、`b_gn`（i_i*BC 行的 g 向量）、`b_g`（i_i 块的 g）；
+- 顺手把派生量 `b_eg = exp(b_g - b_gn[None, :])`、`b_kg = b_k * b_eg`、`b_qg = b_q * b_eg * scale` 一起算到外层——其中 `b_eg` 是 `b_k` / `b_q` 各算一次（共两次同样的 exp），优化后 合成一次，再分别乘 k 和 q。
+
+i_j 循环里只剩跟 j 相关的 `b_gk / b_kt`、两次 BC×BK ↔ BK×BC 的 `tl.dot` 以及对应 `A / Aqk` 写出。NC=4 时内层平均长度 `(1+2+3)/3 = 2`，hoist 把这一层 MTE2/exp 重复读减一半左右；BK 塌缩之后 `make_block_ptr` 数量再砍一档。
+
+注意，前提是方向 1 已让 `i_k` 退化为单步——否则 i_i-only 数据里的 `b_g` 是依赖 i_k 的，hoist 不出去。这也是 把 `tl.static_assert(BK >= K)` 写进 kernel 头部的原因，它把这条前置条件用断言固定下来。
+
+##### 方向 3：把 `b_A *= b_b[:, None]` 折进 dot 尾乘
+
+原来是先 `b_A += tl.dot(b_k, b_ktg)` 再单独 `b_A *= b_b[:, None]`，优化后 改为 `b_A = tl.dot(b_kg, b_ktg) * b_b[:, None]`——同时把 `b_A / b_Aqk` 的 `tl.zeros + +=` 累加器改成单步赋值（因为 i_k 已经塌缩，不需要累加）。
+
+收益体感小但代码层面纯净化：少一次 `BC×BC=16×16` 的 vec pass，少一对 `tl.zeros` 初始化。
+
+### 具体代码修改点
+
+```python
+@@ chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter @@
+-@triton.autotune(
+-    configs=[triton.Config({"BK": 64}, num_warps=4, num_stages=2)],
+-    key=["BC"],
+-)
++# 方向 1：autotune 撤掉，BK 由 wrapper 显式传 next_power_of_2(K)
+ @triton.jit(do_not_specialize=["T"])
+ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(...):
+     ...
++    # 方向 1：单 BK 块覆盖 K，前置条件
++    tl.static_assert(BK >= K)
++
+     for i_i in range(1, NC):
+         if i_t * BT + i_i * BC < T:
++            # —— 方向 2：i_i-only 载入 hoist 到 i_j 循环外 ——
++            p_q = tl.make_block_ptr(q, (T, K), (H * K, 1),
++                                    (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
++            p_k = tl.make_block_ptr(k, (T, K), (H * K, 1),
++                                    (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
++            p_g = tl.make_block_ptr(g, (T, K), (H * K, 1),
++                                    (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
++            o_k  = tl.arange(0, BK)
++            m_k  = o_k < K
++            b_gn = tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k,
++                           mask=m_k, other=0)
++            b_g  = tl.load(p_g, boundary_check=(0, 1))
++            b_eg = exp(b_g - b_gn[None, :])
++            b_kg = tl.load(p_k, boundary_check=(0, 1)) * b_eg
++            b_qg = tl.load(p_q, boundary_check=(0, 1)) * b_eg * scale
++
+             for i_j in range(0, i_i):
+-                b_A   = tl.zeros([BC, BC], dtype=tl.float32)
+-                b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
+-                for i_k in range(tl.cdiv(K, BK)):
+-                    p_q = tl.make_block_ptr(q, ..., (i_t*BT+i_i*BC, i_k*BK), ...)
+-                    p_k = tl.make_block_ptr(k, ..., (i_t*BT+i_i*BC, i_k*BK), ...)
+-                    p_g = tl.make_block_ptr(g, ..., (i_t*BT+i_i*BC, i_k*BK), ...)
+-                    b_kt = tl.make_block_ptr(k, ..., (i_k*BK, i_t*BT+i_j*BC), ...)
+-                    p_gk = tl.make_block_ptr(g, ..., (i_k*BK, i_t*BT+i_j*BC), ...)
+-                    o_k  = i_k * BK + tl.arange(0, BK)
+-                    m_k  = o_k < K
+-                    b_gn = tl.load(g + (i_t*BT+i_i*BC)*H*K + o_k, mask=m_k, other=0)
+-                    b_g  = tl.load(p_g, boundary_check=(0, 1))
+-                    b_k  = tl.load(p_k, boundary_check=(0, 1)) * exp(b_g - b_gn[None, :])
+-                    b_gk = tl.load(p_gk, boundary_check=(0, 1))
+-                    b_kt_val = tl.load(b_kt, boundary_check=(0, 1))
+-                    b_ktg = b_kt_val * exp(b_gn[:, None] - b_gk)
+-                    b_A  += tl.dot(b_k,  b_ktg)
+-                    b_q   = tl.load(p_q, boundary_check=(0, 1))
+-                    b_qg  = b_q * exp(b_g - b_gn[None, :]) * scale
+-                    b_Aqk += tl.dot(b_qg, b_ktg)
+-                b_A *= b_b[:, None]
++                b_kt  = tl.make_block_ptr(k, (K, T), (1, H * K),
++                                          (0, i_t * BT + i_j * BC), (BK, BC), (0, 1))
++                p_gk  = tl.make_block_ptr(g, (K, T), (1, H * K),
++                                          (0, i_t * BT + i_j * BC), (BK, BC), (0, 1))
++                b_gk  = tl.load(p_gk, boundary_check=(0, 1))
++                b_kt  = tl.load(b_kt, boundary_check=(0, 1))
++                b_ktg = b_kt * exp(b_gn[:, None] - b_gk)
++                # —— 方向 3：beta 折进尾乘，去掉累加器 ——
++                b_A   = tl.dot(b_kg, b_ktg) * b_b[:, None]
++                b_Aqk = tl.dot(b_qg, b_ktg)
+                 tl.store(p_A,   b_A.to(A.dtype.element_ty),   boundary_check=(0, 1))
+                 tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+
+@@ def chunk_kda_scaled_dot_kkt_fwd @@
+     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
+         ...,
++        BK=BK,                                              # 方向 1：显式传 BK
+         NC=NC,
+     )
+```
+
+### **性能数据**
+
+| 算子                                                | 1K(us) | 8K(us) |        |        |      |        |
+| --------------------------------------------------- | ------ | ------ | ------ | ------ | ---- | ------ |
+| 优化前                                              | 优化后 | 提升   | 优化前 | 优化后 | 提升 |        |
+| chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter | 1664   | 820    | 50.72% | 13177  | 6344 | 51.86% |
