@@ -508,16 +508,6 @@ class FusedRMSNormGated(CustomOp):
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# num_warps=1, num_stages=1 picked by triton autotune sweep on Ascend
-# 910C over num_warps in {1,2,4,8} x num_stages in {1,2,3,4}, key
-# (BC=32, BK=128) on the 8192-token cu_seqlens scenario. The inter
-# program is small (one i_j=0 pair after the BC=32 collapse), so
-# software pipelining (stages > 1) has no iterations to overlap and
-# extra warps only add scheduling overhead.
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=1, num_stages=1)],
-    key=["BC", "BK"],
-)
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     q,
@@ -538,28 +528,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    # NPU-friendly schedule. Three coupled changes vs the upstream form:
-    #   1) Contiguous access: every K/g block is loaded as a regular
-    #      T-major (BC, BK) tile. The j-side block uses tl.trans before
-    #      the dot instead of the original transposed block_ptr with
-    #      strides=(1, H*K). i-side and j-side now share a single DMA
-    #      template, which lets the triton-ascend lowering emit one
-    #      load schedule and reuse it.
-    #   2) Fewer programs: grid is (NT, B*H) — one program per (chunk,
-    #      head) — instead of (NT, NC, B*H). On Ascend with ~30 AI Cores
-    #      and B*H >= H, this already saturates; lifting i_i into grid
-    #      multiplied the launch count by NC and shrank each program's
-    #      work, hurting per-core utilization.
-    #   3) Single i_k tile: BK is set by the host to next_power_of_2(K)
-    #      (same convention as the intra kernel), so the inner i_k loop
-    #      collapses to one iteration for the typical K=128 case. That
-    #      removes redundant b_gn re-loads and per-iter accumulator
-    #      init.
-    # Plus: the entire i-side (q/k/g/gn/beta + the hoisted exp_anchor
-    # decay) is loaded once per i_i and reused across all i_j sub-blocks
-    # — DMA traffic on the i-side drops from O(NC*(NC-1)) tiles to O(NC).
-    i_t = tl.program_id(0)
-    i_bh = tl.program_id(1)
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
@@ -574,115 +543,99 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    # Even the first inter row sub-block (i_i=1) is past the chunk end:
-    # the whole program is a no-op (i_i=0 has no inter work by construction).
-    if i_t * BT + BC >= T:
-        return
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * H + i_h) * K
+    A += (bos * H + i_h) * BT
+    Aqk += (bos * H + i_h) * BT
 
-    q_base = q + (bos * H + i_h) * K
-    k_base = k + (bos * H + i_h) * K
-    g_base = g + (bos * H + i_h) * K
-    A_base = A + (bos * H + i_h) * BT
-    Aqk_base = Aqk + (bos * H + i_h) * BT
+    # N1 hoists i_k-dependent loads out of the i_j loop; this requires the
+    # K dimension to be covered by a single BK block (i.e. BK >= K).
+    tl.static_assert(BK >= K)
 
-    o_k = tl.arange(0, BK)
-    m_k = o_k < K
-
-    # Outer loop: i_i sub-block of the row range. NC is a constexpr so
-    # Triton unrolls this loop at compile time; the runtime bound check
-    # gates each iteration when the chunk is partial.
     for i_i in range(1, NC):
         if i_t * BT + i_i * BC < T:
-            # ---- i-side: depends on i_i but NOT on i_j --------------
-            # Loaded once and reused across the unrolled i_j loop.
+            p_b = tl.make_block_ptr(
+                beta + bos * H + i_h,
+                (T,), (H,), (i_t * BT + i_i * BC,), (BC,), (0,),
+            )
+            b_b = tl.load(p_b, boundary_check=(0,))
+
+            # Loads that only depend on i_i are hoisted out of the i_j loop.
+            # BK = next_power_of_2(K) >= K, so the K dimension is covered in
+            # a single block and the former i_k loop collapses to one
+            # iteration; expanding it removes the inner scalar overhead.
             p_q = tl.make_block_ptr(
-                q_base, (T, K), (H * K, 1),
-                (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0),
+                q, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0),
+                (BC, BK), (1, 0),
             )
             p_k = tl.make_block_ptr(
-                k_base, (T, K), (H * K, 1),
-                (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0),
+                k, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0),
+                (BC, BK), (1, 0),
             )
             p_g = tl.make_block_ptr(
-                g_base, (T, K), (H * K, 1),
-                (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0),
+                g, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0),
+                (BC, BK), (1, 0),
             )
-            p_b = tl.make_block_ptr(
-                beta + bos * H + i_h, (T,), (H,),
-                (i_t * BT + i_i * BC,), (BC,), (0,),
-            )
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_g = tl.load(p_g, boundary_check=(0, 1))
-            b_b = tl.load(p_b, boundary_check=(0,))
-            # Anchor row of sub-block i_i (single contiguous BK read).
+
+            o_k = tl.arange(0, BK)
+            m_k = o_k < K
             b_gn = tl.load(
-                g_base + (i_t * BT + i_i * BC) * H * K + o_k,
+                g + (i_t * BT + i_i * BC) * H * K + o_k,
                 mask=m_k, other=0,
             )
-            # Hoisted decay factor — appears in both K- and Q-side
-            # products; halves the exp() count vs the upstream kernel.
-            exp_anchor = exp(b_g - b_gn[None, :])
-            b_k_dec = b_k * exp_anchor
-            b_q_dec = b_q * exp_anchor * scale
+            b_g = tl.load(p_g, boundary_check=(0, 1))
+            b_eg = exp(b_g - b_gn[None, :])
+            b_kg = tl.load(p_k, boundary_check=(0, 1)) * b_eg
+            b_qg = tl.load(p_q, boundary_check=(0, 1)) * b_eg * scale
 
-            # ---- j-side: unrolled over NC-1 candidate slots ---------
-            # `range(0, NC - 1)` is constexpr-bounded and unrolls; the
-            # `i_j < i_i` mask drops invalid pairs. Compared to the
-            # original `range(0, i_i)` runtime loop, the unrolled form
-            # exposes all sub-block bodies to the triton-ascend
-            # scheduler so DMA / Cube / Vector pipes can overlap across
-            # them.
-            for i_j in range(0, NC - 1):
-                if i_j < i_i:
-                    p_kj = tl.make_block_ptr(
-                        k_base, (T, K), (H * K, 1),
-                        (i_t * BT + i_j * BC, 0), (BC, BK), (1, 0),
-                    )
-                    p_gj = tl.make_block_ptr(
-                        g_base, (T, K), (H * K, 1),
-                        (i_t * BT + i_j * BC, 0), (BC, BK), (1, 0),
-                    )
-                    b_kj = tl.load(p_kj, boundary_check=(0, 1))
-                    b_gj = tl.load(p_gj, boundary_check=(0, 1))
-                    # j-side decay relative to i_i's anchor.
-                    b_kjg = b_kj * exp(b_gn[None, :] - b_gj)
-                    # Same DMA shape as i-side; transpose happens in
-                    # UB via tl.trans, which lowers to the cube
-                    # transpose unit on Ascend.
-                    b_kjg_T = tl.trans(b_kjg)
-                    b_A = tl.dot(b_k_dec, b_kjg_T)
-                    b_Aqk = tl.dot(b_q_dec, b_kjg_T)
-                    b_A *= b_b[:, None]
+            for i_j in range(0, i_i):
+                b_kt = tl.make_block_ptr(
+                    k, (K, T), (1, H * K),
+                    (0, i_t * BT + i_j * BC),
+                    (BK, BC), (0, 1),
+                )
+                p_gk = tl.make_block_ptr(
+                    g, (K, T), (1, H * K),
+                    (0, i_t * BT + i_j * BC),
+                    (BK, BC), (0, 1),
+                )
+                b_gk = tl.load(p_gk, boundary_check=(0, 1))
+                b_kt_val = tl.load(b_kt, boundary_check=(0, 1))
+                b_ktg = b_kt_val * exp(b_gn[:, None] - b_gk)
 
-                    p_A = tl.make_block_ptr(
-                        A_base, (T, BT), (H * BT, 1),
-                        (i_t * BT + i_i * BC, i_j * BC),
-                        (BC, BC), (1, 0),
-                    )
-                    tl.store(
-                        p_A, b_A.to(A.dtype.element_ty),
-                        boundary_check=(0, 1),
-                    )
-                    p_Aqk = tl.make_block_ptr(
-                        Aqk_base, (T, BT), (H * BT, 1),
-                        (i_t * BT + i_i * BC, i_j * BC),
-                        (BC, BC), (1, 0),
-                    )
-                    tl.store(
-                        p_Aqk, b_Aqk.to(Aqk.dtype.element_ty),
-                        boundary_check=(0, 1),
-                    )
+                b_A = tl.dot(b_kg, b_ktg) * b_b[:, None]
+                b_Aqk = tl.dot(b_qg, b_ktg)
+
+                p_A = tl.make_block_ptr(
+                    A, (T, BT), (H * BT, 1),
+                    (i_t * BT + i_i * BC, i_j * BC),
+                    (BC, BC), (1, 0),
+                )
+                tl.store(
+                    p_A, b_A.to(A.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+                p_Aqk = tl.make_block_ptr(
+                    Aqk, (T, BT), (H * BT, 1),
+                    (i_t * BT + i_i * BC, i_j * BC),
+                    (BC, BC), (1, 0),
+                )
+                tl.store(
+                    p_Aqk, b_Aqk.to(Aqk.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# num_warps=1, num_stages=4 picked by triton autotune sweep on Ascend
-# 910C (same sweep as the inter kernel above). The intra program has
-# enough sequential work — exp_i / exp_j computation, two cube dots,
-# triangular mask, single (BC, BC) store — for stages=4 multi-buffering
-# to overlap MTE / cube / vector pipes effectively.
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=1, num_stages=4)],
+    # Confirmed empirically: num_warps=4, num_stages=2 is best across the
+    # 3x3 grid of {2,4,8} x {1,2,3}; keeping a single Config here so the
+    # autotuner doesn't recompile 9 times on first launch.
+    configs=[triton.Config({}, num_warps=4, num_stages=2)],
     key=["BK", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -702,31 +655,10 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     BT: tl.constexpr,
     BC: tl.constexpr,
     BK: tl.constexpr,
+    NC_PER_PROG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    # NPU-friendly schedule for the diagonal sub-block of A / Aqk.
-    #
-    # Original form: a runtime-bounded `for j in range(min(BC, ...))`
-    # vector loop, computing one column of (A, Aqk) per iteration via
-    # `tl.sum(... * ..., axis=1)` and storing 1-D slices. With BC=32
-    # that is 32 vector-reduce passes + 32 single-column stores per
-    # program, while the cube unit sits idle.
-    #
-    # Rewrite: one (BC, BK) x (BK, BC) -> (BC, BC) cube dot for both
-    # A and Aqk, then triangular mask + single (BC, BC) store. Math
-    # equivalence comes from the same anchor split used in the inter
-    # kernel — for the diagonal block, i-side and j-side share the
-    # same K/g block so no extra DMA is needed:
-    #
-    #     exp(g[i,k] - g[j,k]) = exp(g[i,k] - gn[k]) * exp(gn[k] - g[j,k])
-    #                          = exp_i[i,k] * exp_j[j,k]
-    #
-    # where gn is the anchor row (top of the diagonal block). Two
-    # `exp` calls on (BC, BK) tiles replace BC scalar `exp` calls on
-    # (BK,) tiles. β is kept off `b_k` and applied as a row-vector
-    # broadcast on the (BC, BC) result so that the same `b_k` block
-    # serves both i-side (with exp_i) and j-side (with exp_j).
-    i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_t, i_i_grp, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
@@ -741,88 +673,75 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    if i_t * BT + i_i * BC >= T:
-        return
-
-    row_anchor = i_t * BT + i_i * BC
+    # Alt 1 (conservative): each program handles NC_PER_PROG consecutive
+    # diagonal tiles. grid(1) = NC // NC_PER_PROG, so the scalar work that
+    # does not depend on i_i (bos/i_h offsets, o_i/o_j arange, base pointers)
+    # can be reused across the iterations.
     o_i = tl.arange(0, BC)
     o_j = tl.arange(0, BC)
-    o_k = tl.arange(0, BK)
-    m_k = o_k < K
-    m_row = (row_anchor + o_i) < T
-    m_col = (row_anchor + o_j) < T
-
     q_base = q + (bos * H + i_h) * K
     k_base = k + (bos * H + i_h) * K
     g_base = g + (bos * H + i_h) * K
+    A_base = A + (bos * H + i_h) * BT
+    Aqk_base = Aqk + (bos * H + i_h) * BT
+    beta_base = beta + (bos + i_t * BT) * H + i_h
 
-    p_q = tl.make_block_ptr(
-        q_base, (T, K), (H * K, 1),
-        (row_anchor, 0), (BC, BK), (1, 0),
-    )
-    p_k = tl.make_block_ptr(
-        k_base, (T, K), (H * K, 1),
-        (row_anchor, 0), (BC, BK), (1, 0),
-    )
-    p_g = tl.make_block_ptr(
-        g_base, (T, K), (H * K, 1),
-        (row_anchor, 0), (BC, BK), (1, 0),
-    )
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
+    for ii_off in range(0, NC_PER_PROG):
+        i_i = i_i_grp * NC_PER_PROG + ii_off
+        if i_t * BT + i_i * BC < T:
+            m_i = (i_t * BT + i_i * BC + o_i) < T
+            m_j = (i_t * BT + i_i * BC + o_j) < T
 
-    p_b = beta + (bos + row_anchor + o_i) * H + i_h
-    b_b = tl.load(p_b, mask=m_row, other=0)
+            # Alt C: p_kt/p_gk are transposed views of the same memory as
+            # p_k/p_g (same bos+i_i*BC offset, same BC*BK tile). Load once
+            # and derive the (BK, BC) layout via tl.trans. This removes 2
+            # MTE2 loads and collapses exp(-b_gk) into a reciprocal of the
+            # already-computed b_exp_g.
+            p_q = tl.make_block_ptr(
+                q_base, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0),
+            )
+            p_k = tl.make_block_ptr(
+                k_base, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0),
+            )
+            p_g = tl.make_block_ptr(
+                g_base, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0),
+            )
 
-    # Anchor row of the diagonal block (single contiguous BK read).
-    b_gn = tl.load(
-        g_base + row_anchor * H * K + o_k,
-        mask=m_k, other=0,
-    )
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_g = tl.load(p_g, boundary_check=(0, 1))
 
-    # i-side and j-side anchor decays. j-side uses the same b_g
-    # because the diagonal block is symmetric in source data.
-    exp_i = exp(b_g - b_gn[None, :])              # (BC, BK)  fp32
-    exp_j = exp(b_gn[None, :] - b_g)              # (BC, BK)  fp32
+            p_beta = beta_base + (i_i * BC + o_i) * H
+            b_beta = tl.load(p_beta, mask=m_i, other=0)
 
-    b_q_dec = b_q * exp_i * scale                 # (BC, BK)  fp32
-    b_k_dec = b_k * exp_i                         # (BC, BK)  fp32, no β yet
-    b_kj_dec = b_k * exp_j                        # (BC, BK)  fp32, j-side
-    b_kjT = tl.trans(b_kj_dec)                    # (BK, BC)  fp32
+            b_exp_g = exp(b_g)
 
-    # Note: dot inputs are kept fp32. An earlier attempt cast operands
-    # back to the input dtype (fp16/bf16) hoping to route the cube unit
-    # to its native fma path, but that produced NaN — `exp(b_g - b_gn)`
-    # values can exceed fp16 max (~65504) when `b_g` accumulates large
-    # negative spans, so casting fp32 -> fp16 turns finite intermediates
-    # into inf, then dot accumulates inf -> NaN. The dynamic range of
-    # the KDA decay factor is intrinsic to the algorithm, so the
-    # operands must stay fp32 here.
-    A_pre = tl.dot(b_k_dec, b_kjT)                # (BC, BC)  fp32
-    Aqk_pre = tl.dot(b_q_dec, b_kjT)              # (BC, BC)  fp32
+            b_kg_i = b_k * b_beta[:, None] * b_exp_g
+            b_qg_i = b_q * b_exp_g
+            # b_kt * exp(-b_gk) == trans(b_k * exp(-b_g)) == trans(b_k / b_exp_g)
+            b_ktg_j = tl.trans(b_k / b_exp_g)
 
-    # β is row-broadcast onto A only; Aqk is unscaled by β.
-    A_pre = A_pre * b_b[:, None]
+            b_A = tl.dot(b_kg_i, b_ktg_j)
+            b_Aqk = tl.dot(b_qg_i, b_ktg_j) * scale
 
-    # Diagonal-block triangle masks. A is strict lower (o_i > o_j),
-    # Aqk includes the diagonal (o_i >= o_j). Row/col bounds drop
-    # entries past the chunk's valid length.
-    mask_strict = (o_i[:, None] > o_j[None, :]) & m_row[:, None] & m_col[None, :]
-    mask_lower = (o_i[:, None] >= o_j[None, :]) & m_row[:, None] & m_col[None, :]
-    b_A = tl.where(mask_strict, A_pre, 0.0)
-    b_Aqk = tl.where(mask_lower, Aqk_pre, 0.0)
+            mask_A = (o_i[:, None] > o_j[None, :]) & m_i[:, None] & m_j[None, :]
+            mask_Aqk = (o_i[:, None] >= o_j[None, :]) & m_i[:, None] & m_j[None, :]
+            b_A = tl.where(mask_A, b_A, 0.0)
+            b_Aqk = tl.where(mask_Aqk, b_Aqk, 0.0)
 
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-        (row_anchor, i_i * BC), (BC, BC), (1, 0),
-    )
-    p_Aqk = tl.make_block_ptr(
-        Aqk + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-        (row_anchor, i_i * BC), (BC, BC), (1, 0),
-    )
-    tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+            p_A = tl.make_block_ptr(
+                A_base, (T, BT), (H * BT, 1),
+                (i_t * BT + i_i * BC, i_i * BC), (BC, BC), (1, 0),
+            )
+            p_Aqk = tl.make_block_ptr(
+                Aqk_base, (T, BT), (H * BT, 1),
+                (i_t * BT + i_i * BC, i_i * BC), (BC, BC), (1, 0),
+            )
+            tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
@@ -864,49 +783,37 @@ def chunk_kda_scaled_dot_kkt_fwd(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    # Tile sub-block size. Evolution on Ascend:
-    #   BC=16 (FLA original):  NC=4, inter scalar-bound (6 i_j pairs per
-    #                          chunk), intra vector-bound.
-    #   BC=32 (round 1):       NC=2, inter pairs collapse to 1, gave 2.4x.
-    #                          Intra rewritten to integer-block cube dot.
-    #   BC=64 (rejected):      NC=1, inter skipped; but intra per-program
-    #                          AIV scalar exploded 38us -> 128us (3.4x),
-    #                          most likely from UB pressure pushing
-    #                          intermediates to spill. Net +51% time.
-    # Back at BC=32 as the proven sweet spot.
-    BC = min(32, BT)
+    BC = min(16, BT)
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
     Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
-    # Inter kernel handles off-diagonal sub-blocks (i_i, i_j) with
-    # 0 <= i_j < i_i < NC. With NC=1 there are no such pairs, so the
-    # launch is skipped. (A round of optimization tried folding the
-    # inter work into intra; the merged form failed to compile on
-    # triton-ascend with `cc -> cbuf` errors that no straight-line
-    # rewrite resolved, so the two-kernel form is kept.)
-    if NC > 1:
-        grid = (NT, B * H)
-        chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
-            q=q,
-            k=k,
-            g=gk,
-            beta=beta,
-            A=A,
-            Aqk=Aqk,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            K=K,
-            BT=BT,
-            BC=BC,
-            BK=BK,
-            NC=NC,
-        )
+    grid = (NT, B * H)
+    chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
+        q=q,
+        k=k,
+        g=gk,
+        beta=beta,
+        A=A,
+        Aqk=Aqk,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        K=K,
+        BT=BT,
+        BC=BC,
+        BK=BK,
+        NC=NC,
+    )
 
-    grid = (NT, NC, B * H)
+    # Alt 1 aggressive: each intra program owns all NC diagonal tiles of its
+    # BT chunk. Doubles the MTE2/MTE3 amortization window seen in the
+    # NC_PER_PROG=2 version; grid(1) collapses to 1.
+    NC_PER_PROG = 4
+    assert NC % NC_PER_PROG == 0, "NC must be divisible by NC_PER_PROG"
+    grid = (NT, NC // NC_PER_PROG, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
         q=q,
         k=k,
@@ -923,6 +830,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         BK=BK,
+        NC_PER_PROG=NC_PER_PROG,
     )
     return A, Aqk
 
@@ -1101,8 +1009,8 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
+    BK = 128
+    BV = 128
 
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
@@ -1138,18 +1046,8 @@ def recompute_w_u_fwd(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in [32, 64]
-#         for BV in [64, 128]
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["BT"],
-# )
 @triton.autotune(
-    configs=[triton.Config({"BK": 64, "BV": 128}, num_warps=2, num_stages=4)],
+    configs=[triton.Config({"BK": 128, "BV": 128}, num_warps=2, num_stages=4)],
     key=["BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1170,10 +1068,13 @@ def chunk_gla_fwd_kernel_o(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    H_PACK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_v, i_t, i_bp = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    HP: tl.constexpr = H // H_PACK
+    i_b = i_bp // HP
+    i_hp = i_bp % HP
     if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = (
@@ -1193,71 +1094,78 @@ def chunk_gla_fwd_kernel_o(
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_g = tl.make_block_ptr(
-            g + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
-            (V, K),
-            (K, 1),
-            (i_v * BV, i_k * BK),
-            (BV, BK),
-            (1, 0),
-        )
+    for i_pack in tl.static_range(H_PACK):
+        i_h = i_hp * H_PACK + i_pack
 
-        # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_q = (b_q * scale).to(b_q.dtype)
-        # [BT, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1))
-        # [BT, BK]
-        b_qg = (b_q * exp(b_g)).to(b_q.dtype)
-        # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-        # [BT, BV]
-        if i_k >= 0:
+        b_o = tl.zeros([BT, BV], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            p_q = tl.make_block_ptr(
+                q + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_g = tl.make_block_ptr(
+                g + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_h = tl.make_block_ptr(
+                h + (i_tg * H + i_h) * K * V,
+                (V, K),
+                (K, 1),
+                (i_v * BV, i_k * BK),
+                (BV, BK),
+                (1, 0),
+            )
+
+            # [BT, BK]
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_q = (b_q * scale).to(b_q.dtype)
+            # [BT, BK]
+            b_g = tl.load(p_g, boundary_check=(0, 1))
+            # [BT, BK]
+            b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+            # [BV, BK]
+            b_h = tl.load(p_h, boundary_check=(0, 1))
+            # [BT, BV]
             b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
-    p_v = tl.make_block_ptr(
-        v + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_o = tl.make_block_ptr(
-        o + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    # [BT, BV]
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-    # [BT, BT]
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v, allow_tf32=False)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        p_v = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_o = tl.make_block_ptr(
+            o + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT, 0),
+            (BT, BT),
+            (1, 0),
+        )
+        # [BT, BV]
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        # [BT, BT]
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+        b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
+        b_o += tl.dot(b_A, b_v)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_gla_fwd_o_gk(
@@ -1281,8 +1189,12 @@ def chunk_gla_fwd_o_gk(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
+    H_PACK = (
+        8 if H % 8 == 0 else (4 if H % 4 == 0 else (2 if H % 2 == 0 else 1))
+    )
+
     def grid(meta):
-        return (cdiv(V, meta["BV"]), NT, B * H)
+        return (cdiv(V, meta["BV"]), NT, B * (H // H_PACK))
 
     chunk_gla_fwd_kernel_o[grid](
         q=q,
@@ -1299,6 +1211,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        H_PACK=H_PACK,
     )
     return o
 
