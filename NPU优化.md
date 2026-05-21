@@ -48,10 +48,10 @@
 
 **性能数据：**
 
-| 算子                             | 1K(us) | 8K(us) |        |        |      |        |
-| -------------------------------- | ------ | ------ | ------ | ------ | ---- | ------ |
-| 优化前                           | 优化后 | 提升   | 优化前 | 优化后 | 提升 |        |
-| chunk_local_cumsum_vector_kernel | 5126   | 154    | 97.00% | 41041  | 1408 | 96.57% |
+| 算子                             | 1K(us) |        |        | 8K(us) |        |        |
+| -------------------------------- | ------ | ------ | ------ | ------ | ------ | ------ |
+|                                  | 优化前 | 优化后 | 提升   | 优化前 | 优化后 | 提升   |
+| chunk_local_cumsum_vector_kernel | 5126   | 154    | 97.00% | 41041  | 1408   | 96.57% |
 
 ## 二、chunk_gla_fwd_kernel_o性能优化点
 
@@ -204,10 +204,10 @@ def chunk_gla_fwd_o_gk(...):
 
 测试 case：`(B=1, T=1024, H=32, K=128, V=128, fp16)`，对应 `H_PACK=8`，program 网格从 `(1, 16, 32)` 收缩到 `(1, 16, 4)`，wave 数从 21 降到 3。
 
-| 算子                   | 1K(us) | 8K(us) |        |        |      |        |
-| ---------------------- | ------ | ------ | ------ | ------ | ---- | ------ |
-| 优化前                 | 优化后 | 提升   | 优化前 | 优化后 | 提升 |        |
-| chunk_gla_fwd_kernel_o | 1368   | 233    | 82.97% | 10661  | 1726 | 83.81% |
+| 算子                   | 1K(us) |        |        | 8K(us) |        |        |
+| ---------------------- | ------ | ------ | ------ | ------ | ------ | ------ |
+|                        | 优化前 | 优化后 | 提升   | 优化前 | 优化后 | 提升   |
+| chunk_gla_fwd_kernel_o | 1368   | 233    | 82.97% | 10661  | 1726   | 83.81% |
 
 > 单 program 时间多干 8× 工作只涨 27%，是这次优化生效的直接证据：多出来的 7 份 head 几乎"白送"，因为它们共享了同一笔 ~62 us 的启动税。
 
@@ -324,7 +324,142 @@ i_j 循环里只剩跟 j 相关的 `b_gk / b_kt`、两次 BC×BK ↔ BK×BC 的 
 
 ### **性能数据**
 
-| 算子                                                | 1K(us) | 8K(us) |        |        |      |        |
-| --------------------------------------------------- | ------ | ------ | ------ | ------ | ---- | ------ |
-| 优化前                                              | 优化后 | 提升   | 优化前 | 优化后 | 提升 |        |
-| chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter | 1664   | 820    | 50.72% | 13177  | 6344 | 51.86% |
+| 算子                                                | 1K(us) |        |        | 8K(us) |        |        |
+| --------------------------------------------------- | ------ | ------ | ------ | ------ | ------ | ------ |
+|                                                     | 优化前 | 优化后 | 提升   | 优化前 | 优化后 | 提升   |
+| chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter | 1664   | 820    | 50.72% | 13177  | 6344   | 51.86% |
+
+## 四、merge_16x16_to_64x64_inverse_kernel性能优化点
+
+`merge_16x16_to_64x64_inverse_kernel` 把 4 个 16×16 对角块各自做一次"逆传播 + 单位 I"（求 `(I + L_kk)⁻¹` 的迭代展开），再用 3 次 `tl.dot ∘ tl.dot` 把跨块的 21/32/43 等子块串起来，最终得到 64×64 下三角块逆。基线在 NPU 上 ~716 us，瓶颈在 vec_scalar 路径上的循环开销和无效 `tl.where`。
+
+**问题（base 版本的浪费点）：**
+
+1. **autotune 配置过宽**：base 配 `nw ∈ {2,4,8} × ns ∈ {2,3,4,5}` 共 12 组。NPU 上每开一个 config 都要 JIT profiling 一次首包，且实测最优只有一个点 `(8, 4)`，其余都是噪声。
+2. **`tl.where(m_A, b_Ai_xx, 0)` 是空操作**：`m_A = o_i[:, None] > o_i[None, :]` 是严格下三角 mask，但 `b_Ai_xx` 来自上游 `kda.py` `mask_A` 构造时已经是严格下三角（对角与上三角恒为 0）。这一行 `where` 把 0 替成 0，纯属一次 16×16 vec pass 白跑——而且 `tl.where` 在大 tile 上会落到 aiv_scalar 路径。
+3. **4 个对角块的行更新写成 4 个串行 for 循环**：每个 block 各自 `for i in range(2, 16)` / `for i in range(16+2, 32)` / 32+2..48 / 48+2..64，循环计数器、`min(...)` 边界判断、迭代 ramp-up 全部翻 4 倍。但其实 4 个块在每一轮里数据流互相独立（各自只读写自己的 `b_Ai_xx`），完全可以打成同一个 `for i` 内层。
+
+本次共做三件事：
+
+### 方向 1：autotune 收敛到单一最优配置
+
+把 12 组 config 直接砍到 `(num_warps=8, num_stages=4)` 一个点。这是 [[kda-bottleneck-overview]] 上 solve_tril 这一支反复 sweep 后的 converged 选择，autotune 网格扩展到 18 个 config 测过是零 EV（参见 [[npu-triton-autotune-grid]]），把它固化下来既消掉首包 12× JIT 损耗，也避免 autotuner 单 run 内的噪声给出错误"赢家"（这个坑 `recompute_w_u_fwd` 上踩过，详见 [[kda-bottleneck-overview]] 里的脚注）。
+
+### 方向 2：删掉无效的 `tl.where(m_A, ...)` 空 pass
+
+直接 `b_Ai_xx = -b_Ai_xx`，省掉 4 次 16×16 `tl.where` 和对应的 `m_A` 掩码生成。
+
+正确性前提：上游 `kda.py` 的 `mask_A` 在写出 A 时已经把对角和上三角清零，下三角矩阵性质由生产者保证；这一段在 NPU Triton 上又特别敏感（`tl.where` 的 2D 大 tile 会被降到 aiv_scalar 路径，参见 [[feedback-npu-triton-large-tile-scalar]]）。删掉是纯净化优化，但因为是 vec 路径上的 4 次 pass，体感不小。
+
+### 方向 3：把 4 个独立的 for 循环 interleave 成单个 for（最关键一招）
+
+base 的写法是 4 个串行 for：
+
+```python
+for i in range(2, min(16, T - i_t * BT)):           # block 11
+    ...
+for i in range(16 + 2, min(32, T - i_t * BT)):      # block 22
+    ...
+for i in range(32 + 2, min(48, T - i_t * BT)):      # block 33
+    ...
+for i in range(48 + 2, min(64, T - i_t * BT)):      # block 44
+    ...
+```
+
+优化后合并成一个：
+
+```python
+T_local = T - i_t * BT
+for i in range(2, min(16, T_local)):                # 共享同一个 i ∈ [2, 16)
+    # block 11
+    b_a_11 = -tl.load(A + (i_t*BT + i)      *H*BT + o_i)
+    b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+    b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+    # block 22 / 33 / 44 由编译期可剪枝的 if 守护，避免越界
+    if 16 + i < T_local:
+        b_a_22 = -tl.load(A + (i_t*BT + 16 + i) *H*BT + o_i + 16)
+        ...
+    if 32 + i < T_local:
+        ...
+    if 48 + i < T_local:
+        ...
+```
+
+**为什么有效：**
+
+- 4 个 block 在每一轮 i 内**数据流互相独立**——每一行 `b_a_xx` 只读写自己的 `b_Ai_xx`，没有跨块依赖。Triton-Ascend 后端能把 4 组 load / sum / where 在同一迭代里 overlap 进 MTE2/Vec 流水。
+- 循环计数器、`min()` 边界、循环 ramp-up 在 4 个 block 之间被摊薄到 1 份，scalar overhead 从 4× 折回 1×。
+- 重新参数化下标：`b_a_22` 里的 `(o_i == i - 16)[:, None]` 改成 `(o_i == i)[:, None]`、配合行偏移 `16 + i` 与列偏移 `+16` 匹配，使 4 个 block 共用同一个迭代变量 i ∈ [2, 16)，没有 i ∈ [18, 32) 这种漂移。
+
+### 具体代码修改点
+
+```python
+@@ merge_16x16_to_64x64_inverse_kernel @@
+ @triton.autotune(
+     configs=[
+-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+-        for num_warps in [2, 4, 8]
+-        for num_stages in [2, 3, 4, 5]
++        triton.Config({}, num_warps=nw, num_stages=ns)        # 方向 1：固化
++        for nw in [8]
++        for ns in [4]
+     ],
+     key=["H", "BT", "IS_VARLEN"],
+ )
+@@ def merge_16x16_to_64x64_inverse_kernel(...):
+     o_i = tl.arange(0, 16)
+-    m_A = o_i[:, None] > o_i[None, :]                         # 方向 2：删掉
+     m_I = o_i[:, None] == o_i[None, :]
+     ...
+-    # [16, 16]
+-    b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)                      # 方向 2：4 次空 pass
+-    b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
+-    b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
+-    b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
++    b_Ai_11 = -b_Ai_11                                        # 直接取负
++    b_Ai_22 = -b_Ai_22
++    b_Ai_33 = -b_Ai_33
++    b_Ai_44 = -b_Ai_44
+
+-    for i in range(2, min(16, T - i_t * BT)):                 # 方向 3：4 个 for
+-        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
+-        b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+-        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+-    for i in range(16 + 2, min(32, T - i_t * BT)):
+-        b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
+-        b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
+-        b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
+-    for i in range(32 + 2, min(48, T - i_t * BT)):
+-        b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
+-        b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
+-        b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
+-    for i in range(48 + 2, min(64, T - i_t * BT)):
+-        b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
+-        b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
+-        b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
++    # 方向 3：4 个独立循环 interleave 进单个 for，共享 i ∈ [2, 16)
++    T_local = T - i_t * BT
++    for i in range(2, min(16, T_local)):
++        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
++        b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
++        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
++        if 16 + i < T_local:
++            b_a_22 = -tl.load(A + (i_t * BT + 16 + i) * H * BT + o_i + 16)
++            b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
++            b_Ai_22 = tl.where((o_i == i)[:, None], b_a_22, b_Ai_22)
++        if 32 + i < T_local:
++            b_a_33 = -tl.load(A + (i_t * BT + 32 + i) * H * BT + o_i + 32)
++            b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
++            b_Ai_33 = tl.where((o_i == i)[:, None], b_a_33, b_Ai_33)
++        if 48 + i < T_local:
++            b_a_44 = -tl.load(A + (i_t * BT + 48 + i) * H * BT + o_i + 48)
++            b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
++            b_Ai_44 = tl.where((o_i == i)[:, None], b_a_44, b_Ai_44)
+```
+
+### 性能数据
+
+| 算子                                | 1K(us) |        |        | 8K(us) |        |        |
+| ----------------------------------- | ------ | ------ | ------ | ------ | ------ | ------ |
+|                                     | 优化前 | 优化后 | 提升   | 优化前 | 优化后 | 提升   |
+| merge_16x16_to_64x64_inverse_kernel | 714    | 536    | 24.93% | 5317   | 4101   | 22.87% |
