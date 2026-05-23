@@ -1091,7 +1091,10 @@ def recompute_w_u_fwd(
 #     key=["BT"],
 # )
 @triton.autotune(
-    configs=[triton.Config({"BK": 64, "BV": 128}, num_warps=2, num_stages=4)],
+    configs=[
+        triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=2),
+    ],
     key=["BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1162,18 +1165,11 @@ def chunk_gla_fwd_kernel_o(
             (1, 0),
         )
 
-        # [BT, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_q = (b_q * scale).to(b_q.dtype)
-        # [BT, BK]
         b_g = tl.load(p_g, boundary_check=(0, 1))
-        # [BT, BK]
-        b_qg = (b_q * exp(b_g)).to(b_q.dtype)
-        # [BV, BK]
+        b_qg = (b_q.to(tl.float32) * scale * exp(b_g.to(tl.float32))).to(b_q.dtype)
         b_h = tl.load(p_h, boundary_check=(0, 1))
-        # [BT, BV]
-        if i_k >= 0:
-            b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+        b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),
@@ -1198,7 +1194,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v, allow_tf32=False)
+    b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
