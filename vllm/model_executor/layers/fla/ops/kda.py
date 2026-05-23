@@ -1093,6 +1093,7 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 128, "BV": 128}, num_warps=2, num_stages=2),
         triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=2),
     ],
     key=["BT"],
@@ -1105,6 +1106,7 @@ def chunk_gla_fwd_kernel_o(
     h,
     o,
     A,
+    tril_mask,
     cu_seqlens,
     chunk_indices,
     scale,
@@ -1135,8 +1137,6 @@ def chunk_gla_fwd_kernel_o(
         NT = tl.cdiv(T, BT)
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
-
-    m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
@@ -1189,11 +1189,13 @@ def chunk_gla_fwd_kernel_o(
     p_A = tl.make_block_ptr(
         A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
-    # [BT, BV]
+    p_mask = tl.make_block_ptr(
+        tril_mask, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0),
+    )
+    b_mask = tl.load(p_mask)
     b_v = tl.load(p_v, boundary_check=(0, 1))
-    # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
+    b_A = (b_A.to(tl.float32) * b_mask).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1219,6 +1221,8 @@ def chunk_gla_fwd_o_gk(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
+    tril_mask = torch.tril(torch.ones(BT, BT, dtype=torch.float32, device=q.device))
+
     def grid(meta):
         return (cdiv(V, meta["BV"]), NT, B * H)
 
@@ -1229,6 +1233,7 @@ def chunk_gla_fwd_o_gk(
         h=h,
         o=o,
         A=A,
+        tril_mask=tril_mask,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
