@@ -21,12 +21,26 @@ is in active scope. Treat the rest as read-only context.
 
 - `vllm/model_executor/layers/fla/ops/kda.py` — the kernels under test
   (`chunk_kda`, `fused_recurrent_kda`, `fused_kda_gate`, `FusedRMSNormGated`).
+  Has NPU-specific scheduling rewrites:
+  - `chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter` uses a `(NT, B*H)` grid
+    and contiguous T-major tiles instead of upstream's `(NT, NC, B*H)` grid with
+    transposed strides.
+  - `chunk_gla_fwd_kernel_o` replaces in-kernel `tl.arange` mask computation with
+    a pre-computed `torch.tril` buffer passed as a kernel argument, reducing AIV
+    scalar占比 and achieving ~11.6x speedup on Ascend.
+- `vllm/model_executor/layers/fla/ops/cumsum.py` — `chunk_local_cumsum` modified
+  to use `tl.cumsum` instead of `tl.dot` with a lower-triangular mask, reducing
+  scalar operations from ~97% to minimal on Ascend.
 - `vllm/model_executor/layers/kda.py` — `KimiDeltaAttention` layer that wires
   the kernels into vLLM's prefill (`chunk_kda`) and decode
   (`fused_recurrent_kda`) paths.
 - `tests/kernels/test_chunk_kda_npu.py` — prefill kernel precision test.
+  **Currently only 1 parametrization is active** (`H32-D128-cu[0,8192]-float16`);
+  the other 8 are commented out (commit `2f0251e`). The report lists 9 but the
+  file only runs the 8K case. Uncomment before adding new cases.
 - `tests/kernels/test_fused_recurrent_kda_npu.py` — decode kernel precision test
   (3 functions: non-inplace varlen, inplace + `ssm_state_indices`, fp32).
+  All parametrizations are active (10 + 5 + 4 = 19 cases).
 - `tests/kernels/test_kda_npu_report.md` — coverage-vs-vLLM-call-site matrix.
   Read this before changing test parametrizations or adding scenarios; it is
   the spec for what these tests must cover.
@@ -51,12 +65,12 @@ are checked. Any NaN in kernel output fails the test.
 
 Both files carry `@pytest.mark.skip_global_cleanup`, which is honored by the
 top-level `tests/conftest.py` to skip the post-test distributed cleanup
-(see `should_do_global_cleanup_after_test` at `tests/conftest.py:254`). Do
+(see `should_do_global_cleanup_after_test` at `tests/conftest.py:255`). Do
 not remove that marker — it is required to avoid initializing the full vLLM
 distributed env for kernel-only tests.
 
 `tests/conftest.py` also gates `@pytest.mark.optional` behind a `--optional`
-flag (`tests/conftest.py:1452`); KDA tests do not use it, but other tests
+flag (`tests/conftest.py:1454`); KDA tests do not use it, but other tests
 under `tests/` will silently skip without the flag.
 
 ## Non-obvious correctness gotchas
