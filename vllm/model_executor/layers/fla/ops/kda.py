@@ -1107,7 +1107,6 @@ def chunk_gla_fwd_kernel_o(
     h_trans,
     o,
     A,
-    tril_mask,
     cu_seqlens,
     chunk_indices,
     T,
@@ -1178,13 +1177,8 @@ def chunk_gla_fwd_kernel_o(
     p_A = tl.make_block_ptr(
         A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
-    p_mask = tl.make_block_ptr(
-        tril_mask, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0),
-    )
-    b_mask = tl.load(p_mask)
     b_v = tl.load(p_v, boundary_check=(0,))
-    b_A = tl.load(p_A, boundary_check=(0,))
-    b_A = (b_A * b_mask).to(b_v.dtype)
+    b_A = tl.load(p_A, boundary_check=(0,)).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
@@ -1213,7 +1207,9 @@ def chunk_gla_fwd_o_gk(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    tril_mask = torch.tril(torch.ones(BT, BT, dtype=q.dtype, device=q.device))
+    A.view(NT, BT, H, BT).mul_(
+        torch.tril(torch.ones(BT, BT, dtype=A.dtype, device=A.device))[:, None, :]
+    )
 
     def grid(meta):
         return (cdiv(V, meta["BV"]), NT, B * H)
@@ -1224,7 +1220,6 @@ def chunk_gla_fwd_o_gk(
         h_trans=h_trans,
         o=o,
         A=A,
-        tril_mask=tril_mask,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
