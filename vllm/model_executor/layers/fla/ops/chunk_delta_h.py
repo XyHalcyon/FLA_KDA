@@ -40,7 +40,11 @@ NUM_WARPS = [2, 4, 8, 16]
 #     use_cuda_graph=use_cuda_graph,
 # )
 @triton.autotune(
-    configs=[triton.Config({"BV": 64}, num_warps=4, num_stages=3)],
+    configs=[
+        triton.Config({"BV": 128}, num_warps=8, num_stages=3),
+        # triton.Config({"BV": 128}, num_warps=4, num_stages=3),
+        # triton.Config({"BV": 64}, num_warps=4, num_stages=3),
+    ],
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )
