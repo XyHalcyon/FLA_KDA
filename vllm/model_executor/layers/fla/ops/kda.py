@@ -1092,11 +1092,11 @@ def recompute_w_u_fwd(
 # )
 @triton.autotune(
     configs=[
-        triton.Config({"BK": 128, "BV": 128}, num_warps=2, num_stages=2),
         triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BK": 128, "BV": 128}, num_warps=2, num_stages=3),
-        triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=2),
+        # triton.Config({"BK": 128, "BV": 128}, num_warps=2, num_stages=2),
+        # triton.Config({"BK": 128, "BV": 128}, num_warps=2, num_stages=3),
+        # triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=3),
+        # triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=2),
     ],
     key=["BT"],
 )
