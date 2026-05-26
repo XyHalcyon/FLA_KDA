@@ -229,8 +229,8 @@ def merge_16x16_to_32x32_inverse_kernel(
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
+#         for num_warps in [4, 8]
+#         for num_stages in [3, 4, 5]
 #     ],
 #     key=["H", "BT", "IS_VARLEN"],
 # )
@@ -242,6 +242,8 @@ def merge_16x16_to_32x32_inverse_kernel(
 def merge_16x16_to_64x64_inverse_kernel(
     A,
     Ai,
+    tril_strict_16,
+    eye_16,
     cu_seqlens,
     chunk_indices,
     T,
@@ -267,8 +269,15 @@ def merge_16x16_to_64x64_inverse_kernel(
         bos, eos = i_b * T, i_b * T + T
 
     o_i = tl.arange(0, 16)
-    m_A = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
+    o_i = tl.arange(0, 16)
+    p_tril = tl.make_block_ptr(
+        tril_strict_16, (16, 16), (16, 1), (0, 0), (16, 16), (1, 0)
+    )
+    p_eye = tl.make_block_ptr(
+        eye_16, (16, 16), (16, 1), (0, 0), (16, 16), (1, 0)
+    )
+    b_tril = tl.load(p_tril)
+    b_eye = tl.load(p_eye)
     A += (bos * H + i_h) * BT
     Ai += (bos * H + i_h) * BT
 
@@ -298,31 +307,35 @@ def merge_16x16_to_64x64_inverse_kernel(
         b_Ai_44 = desc.load([i_t * BT + 48, 48]).to(tl.float32)
 
     # [16, 16]
-    b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
-    b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
-    b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
-    b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
+    b_Ai_11 = -b_Ai_11 * b_tril
+    b_Ai_22 = -b_Ai_22 * b_tril
+    b_Ai_33 = -b_Ai_33 * b_tril
+    b_Ai_44 = -b_Ai_44 * b_tril
 
+    base = i_t * BT
     for i in range(2, min(16, T - i_t * BT)):
-        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
+        ii = base + i
+        cond = (o_i == i)[:, None]
+        # Block 11
+        b_a_11 = -tl.load(A + (ii) * H * BT + o_i)
         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
-        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
-    for i in range(16 + 2, min(32, T - i_t * BT)):
-        b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
+        b_Ai_11 = tl.where(cond, b_a_11, b_Ai_11)
+        # Block 22
+        b_a_22 = -tl.load(A + (ii + 16) * H * BT + o_i + 16)
         b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
-        b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
-    for i in range(32 + 2, min(48, T - i_t * BT)):
-        b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
+        b_Ai_22 = tl.where(cond, b_a_22, b_Ai_22)
+        # Block 33
+        b_a_33 = -tl.load(A + (ii + 32) * H * BT + o_i + 32)
         b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
-        b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
-    for i in range(48 + 2, min(64, T - i_t * BT)):
-        b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
+        b_Ai_33 = tl.where(cond, b_a_33, b_Ai_33)
+        # Block 44
+        b_a_44 = -tl.load(A + (ii + 48) * H * BT + o_i + 48)
         b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
-        b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
-    b_Ai_11 += m_I
-    b_Ai_22 += m_I
-    b_Ai_33 += m_I
-    b_Ai_44 += m_I
+        b_Ai_44 = tl.where(cond, b_a_44, b_Ai_44)
+    b_Ai_11 = b_Ai_11 + b_eye
+    b_Ai_22 = b_Ai_22 + b_eye
+    b_Ai_33 = b_Ai_33 + b_eye
+    b_Ai_44 = b_Ai_44 + b_eye
 
     if not USE_TMA:
         p_A_21 = tl.make_block_ptr(
@@ -548,7 +561,12 @@ def solve_tril(
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
 
-    merge_fn[NT, B * H](
+    tril_strict_16 = torch.tril(
+        torch.ones(16, 16, device=A.device, dtype=torch.float32), diagonal=-1
+    )
+    eye_16 = torch.eye(16, device=A.device, dtype=torch.float32)
+
+    common_kwargs = dict(
         A=A,
         Ai=Ai,
         cu_seqlens=cu_seqlens,
@@ -559,4 +577,9 @@ def solve_tril(
         USE_TMA=is_tma_supported,
         DOT_PRECISION=FLA_TRIL_PRECISION,
     )
+    if BT == 64:
+        common_kwargs["tril_strict_16"] = tril_strict_16
+        common_kwargs["eye_16"] = eye_16
+
+    merge_fn[NT, B * H](**common_kwargs)
     return Ai
