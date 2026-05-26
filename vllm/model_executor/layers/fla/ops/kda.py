@@ -1190,7 +1190,7 @@ def chunk_gla_fwd_o_gk(
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     H_PACK = (
-        8 if H % 8 == 0 else (4 if H % 4 == 0 else (2 if H % 2 == 0 else 1))
+        4 if H % 4 == 0 else (2 if H % 2 == 0 else 1)
     )
 
     def grid(meta):
@@ -1427,3 +1427,4 @@ def fused_kda_gate(
 
     y = y.view(*orig_shape, H, head_k_dim)
     return y
+
