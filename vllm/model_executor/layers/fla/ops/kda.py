@@ -518,7 +518,7 @@ class FusedRMSNormGated(CustomOp):
 #     key=["BC"],
 # )
 @triton.autotune(
-    configs=[triton.Config({"BK": 64}, num_warps=4, num_stages=2)],
+    configs=[triton.Config({}, num_warps=4, num_stages=2)],
     key=["BC"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -541,6 +541,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    tl.static_assert(BK >= K)
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -802,6 +803,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         K=K,
         BT=BT,
         BC=BC,
+        BK=BK,
         NC=NC,
     )
 
