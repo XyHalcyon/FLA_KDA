@@ -99,9 +99,12 @@ def chunk_local_cumsum_vector_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    H_PACK: tl.constexpr,
 ):
-    i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_s, i_t, i_bp = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    HP: tl.constexpr = H // H_PACK
+    i_b = i_bp // HP
+    i_hp = i_bp % HP
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -115,47 +118,49 @@ def chunk_local_cumsum_vector_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-    else:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-    # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    b_o = tl.cumsum(b_s, axis=0)
-    if REVERSE:
-        b_z = tl.sum(b_s, axis=0)
-        b_o = -b_o + b_z[None, :] + b_s
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    for i_pack in tl.static_range(H_PACK):
+        i_h = i_hp * H_PACK + i_pack
+        if HEAD_FIRST:
+            p_s = tl.make_block_ptr(
+                s + (bos * H + i_h * T) * S,
+                (T, S),
+                (S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+            p_o = tl.make_block_ptr(
+                o + (bos * H + i_h * T) * S,
+                (T, S),
+                (S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+        else:
+            p_s = tl.make_block_ptr(
+                s + (bos * H + i_h) * S,
+                (T, S),
+                (H * S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+            p_o = tl.make_block_ptr(
+                o + (bos * H + i_h) * S,
+                (T, S),
+                (H * S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+        # [BT, BS]
+        b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+        b_o = tl.cumsum(b_s, axis=0)
+        if REVERSE:
+            b_z = tl.sum(b_s, axis=0)
+            b_o = -b_o + b_z[None, :] + b_s
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_local_cumsum_scalar(
@@ -218,8 +223,12 @@ def chunk_local_cumsum_vector(
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
+    H_PACK = (
+        8 if H % 8 == 0 else (4 if H % 4 == 0 else (2 if H % 2 == 0 else 1))
+    )
+
     def grid(meta):
-        return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
+        return (triton.cdiv(meta["S"], meta["BS"]), NT, B * (H // H_PACK))
 
     # keep cumulative normalizer in fp32
     # this kernel is equivalent to
@@ -236,6 +245,7 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        H_PACK=H_PACK,
     )
     return g
 
