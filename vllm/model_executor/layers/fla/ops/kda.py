@@ -689,7 +689,6 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     o_k = tl.arange(0, BK)
     m_k = o_k < K
     m_A = (i_t * BT + i_i * BC + o_i) < T
-    o_A = (bos + i_t * BT + i_i * BC + o_i) * H * BT + i_h * BT + i_i * BC
 
     p_q = tl.make_block_ptr(
         q + (bos * H + i_h) * K,
@@ -720,23 +719,56 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     b_g = tl.load(p_g, boundary_check=(0, 1))
 
     p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
-    b_k = b_k * tl.load(p_b, mask=m_A, other=0)[:, None]
+    b_beta = tl.load(p_b, mask=m_A, other=0)
 
-    p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
-    p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
+    # === 优化 A：用 tl.dot 替代 BC 轮 vec reduce，走 cube ===
+    # 原: 16 轮 j 循环，每轮算 [BC,BK] 元素乘 + sum，共 32 次 BC×BK reduce
+    # 现: 一次性载入整块 b_kt[BC,BK]/b_gk[BC,BK]，预乘 exp(b_g)/exp(-b_gk)，
+    #     用 2 次 BC×BC dot 一次性算出整个对角块，再用下三角 mask 出有效项
+    #
+    # 数学上：
+    #   原式  b_A[i,j]   = sum_k b_k[i,k] * b_kt[j,k] * exp(b_g[i,k] - b_gk[j,k])
+    #                    = sum_k (b_k[i,k]*exp(b_g[i,k])) * (b_kt[j,k]*exp(-b_gk[j,k]))
+    #         b_Aqk[i,j] = sum_k b_q[i,k] * 同上
+    #   等价  令 P[i,k] = b_k[i,k]*exp(b_g[i,k])*β[i],  Q[i,k] = b_q[i,k]*exp(b_g[i,k])
+    #         令 R[j,k] = b_kt[j,k]*exp(-b_gk[j,k])
+    #   则    b_A   = P · R^T   (BC×BC)
+    #         b_Aqk = Q · R^T * scale
+    # b_kt = b_k 本块，b_gk = b_g 本块（行就是 j），所以 R 直接 = b_k * exp(-b_g)
+    b_eg = exp(b_g)
+    b_emg = exp(-b_g)
+    b_R = b_k * b_emg                    # [BC, BK] 即 b_kt * exp(-b_gk)
+    b_P = b_k * b_eg * b_beta[:, None]   # [BC, BK]
+    b_Q = b_q * b_eg                     # [BC, BK]
 
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-        b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_ktg = b_kt[None, :] * exp(b_g - b_gk[None, :])
-        b_A = tl.sum(b_k * b_ktg, 1)
-        b_A = tl.where(o_i > j, b_A, 0.0)
-        b_Aqk = tl.sum(b_q * b_ktg, 1)
-        b_Aqk = tl.where(o_i >= j, b_Aqk * scale, 0.0)
-        tl.store(A + o_A + j, b_A, mask=m_A)
-        tl.store(Aqk + o_A + j, b_Aqk, mask=m_A)
-        p_kt += H * K
-        p_gk += H * K
+    # [BC, BC] = [BC, BK] @ [BK, BC]
+    b_A = tl.dot(b_P, tl.trans(b_R))
+    b_Aqk = tl.dot(b_Q, tl.trans(b_R)) * scale
+
+    # 下三角 mask：原代码 b_A 用 o_i > j（严格下三角，对角=0）
+    #            b_Aqk 用 o_i >= j（包含对角）
+    b_A = tl.where(o_i[:, None] > o_i[None, :], b_A, 0.0)
+    b_Aqk = tl.where(o_i[:, None] >= o_i[None, :], b_Aqk, 0.0)
+
+    # 写出 [BC, BC] 块
+    p_A = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + i_i * BC, i_i * BC),
+        (BC, BC),
+        (1, 0),
+    )
+    p_Aqk = tl.make_block_ptr(
+        Aqk + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + i_i * BC, i_i * BC),
+        (BC, BC),
+        (1, 0),
+    )
+    tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
