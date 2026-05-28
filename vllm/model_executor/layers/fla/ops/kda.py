@@ -571,57 +571,52 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
             )
             b_b = tl.load(p_b, boundary_check=(0,))
 
+            # === 方向 2：i_i-only 载入 hoist 到 i_j 循环外 ===
+            # BK >= K 已由 static_assert 保证，i_k 仅一步，可安全外提
+            p_q = tl.make_block_ptr(
+                q, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0),
+                (BC, BK), (1, 0),
+            )
+            p_k = tl.make_block_ptr(
+                k, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0),
+                (BC, BK), (1, 0),
+            )
+            p_g = tl.make_block_ptr(
+                g, (T, K), (H * K, 1),
+                (i_t * BT + i_i * BC, 0),
+                (BC, BK), (1, 0),
+            )
+            o_k = tl.arange(0, BK)
+            m_k = o_k < K
+            b_gn = tl.load(
+                g + (i_t * BT + i_i * BC) * H * K + o_k,
+                mask=m_k, other=0,
+            )
+            b_g = tl.load(p_g, boundary_check=(0, 1))
+            b_eg = exp(b_g - b_gn[None, :])
+            b_kg = tl.load(p_k, boundary_check=(0, 1)) * b_eg
+            b_qg = tl.load(p_q, boundary_check=(0, 1)) * b_eg * scale
+
             for i_j in range(0, i_i):
-                b_A = tl.zeros([BC, BC], dtype=tl.float32)
-                b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
-                for i_k in range(tl.cdiv(K, BK)):
-                    p_q = tl.make_block_ptr(
-                        q, (T, K), (H * K, 1),
-                        (i_t * BT + i_i * BC, i_k * BK),
-                        (BC, BK), (1, 0),
-                    )
-                    p_k = tl.make_block_ptr(
-                        k, (T, K), (H * K, 1),
-                        (i_t * BT + i_i * BC, i_k * BK),
-                        (BC, BK), (1, 0),
-                    )
-                    p_g = tl.make_block_ptr(
-                        g, (T, K), (H * K, 1),
-                        (i_t * BT + i_i * BC, i_k * BK),
-                        (BC, BK), (1, 0),
-                    )
-                    b_kt = tl.make_block_ptr(
-                        k, (K, T), (1, H * K),
-                        (i_k * BK, i_t * BT + i_j * BC),
-                        (BK, BC), (0, 1),
-                    )
-                    p_gk = tl.make_block_ptr(
-                        g, (K, T), (1, H * K),
-                        (i_k * BK, i_t * BT + i_j * BC),
-                        (BK, BC), (0, 1),
-                    )
+                b_kt = tl.make_block_ptr(
+                    k, (K, T), (1, H * K),
+                    (0, i_t * BT + i_j * BC),
+                    (BK, BC), (0, 1),
+                )
+                p_gk = tl.make_block_ptr(
+                    g, (K, T), (1, H * K),
+                    (0, i_t * BT + i_j * BC),
+                    (BK, BC), (0, 1),
+                )
+                b_gk = tl.load(p_gk, boundary_check=(0, 1))
+                b_kt_val = tl.load(b_kt, boundary_check=(0, 1))
+                b_ktg = b_kt_val * exp(b_gn[:, None] - b_gk)
 
-                    o_k = i_k * BK + tl.arange(0, BK)
-                    m_k = o_k < K
-                    b_gn = tl.load(
-                        g + (i_t * BT + i_i * BC) * H * K + o_k,
-                        mask=m_k, other=0,
-                    )
-                    b_g = tl.load(p_g, boundary_check=(0, 1))
-                    b_k = (
-                        tl.load(p_k, boundary_check=(0, 1))
-                        * exp(b_g - b_gn[None, :])
-                    )
-                    b_gk = tl.load(p_gk, boundary_check=(0, 1))
-                    b_kt_val = tl.load(b_kt, boundary_check=(0, 1))
-                    b_ktg = b_kt_val * exp(b_gn[:, None] - b_gk)
-                    b_A += tl.dot(b_k, b_ktg)
-
-                    b_q = tl.load(p_q, boundary_check=(0, 1))
-                    b_qg = b_q * exp(b_g - b_gn[None, :]) * scale
-                    b_Aqk += tl.dot(b_qg, b_ktg)
-
-                b_A *= b_b[:, None]
+                # === 方向 3：β 折进 dot 尾乘，去掉累加器 ===
+                b_A = tl.dot(b_kg, b_ktg) * b_b[:, None]
+                b_Aqk = tl.dot(b_qg, b_ktg)
 
                 p_A = tl.make_block_ptr(
                     A, (T, BT), (H * BT, 1),
