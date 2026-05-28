@@ -81,7 +81,7 @@ def chunk_local_cumsum_scalar_kernel(
 #     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
 # )
 @triton.autotune(
-    configs=[triton.Config({"BS": 32}, num_warps=8)],
+    configs=[triton.Config({"BS": 64}, num_warps=8)],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])
