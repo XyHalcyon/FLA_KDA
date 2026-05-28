@@ -666,9 +666,12 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     BC: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    H_PACK: tl.constexpr,
 ):
-    i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_t, i_i, i_bp = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    HP: tl.constexpr = H // H_PACK
+    i_b = i_bp // HP
+    i_hp = i_bp % HP
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -686,89 +689,75 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         return
 
     o_i = tl.arange(0, BC)
-    o_k = tl.arange(0, BK)
-    m_k = o_k < K
     m_A = (i_t * BT + i_i * BC + o_i) < T
 
-    p_q = tl.make_block_ptr(
-        q + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    p_k = tl.make_block_ptr(
-        k + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    p_g = tl.make_block_ptr(
-        g + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
+    # === H_PACK：一个 program 静态展开 H_PACK 个 head，共享 i_t/i_i 与 bos ===
+    # bos/m_A/o_i 与 head 无关，外层只算一次
+    for i_pack in tl.static_range(H_PACK):
+        i_h = i_hp * H_PACK + i_pack
 
-    p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
-    b_beta = tl.load(p_b, mask=m_A, other=0)
+        p_q = tl.make_block_ptr(
+            q + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, 0),
+            (BC, BK),
+            (1, 0),
+        )
+        p_k = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, 0),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, 0),
+            (BC, BK),
+            (1, 0),
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1))
 
-    # === 优化 A：用 tl.dot 替代 BC 轮 vec reduce，走 cube ===
-    # 原: 16 轮 j 循环，每轮算 [BC,BK] 元素乘 + sum，共 32 次 BC×BK reduce
-    # 现: 一次性载入整块 b_kt[BC,BK]/b_gk[BC,BK]，预乘 exp(b_g)/exp(-b_gk)，
-    #     用 2 次 BC×BC dot 一次性算出整个对角块，再用下三角 mask 出有效项
-    #
-    # 数学上：
-    #   原式  b_A[i,j]   = sum_k b_k[i,k] * b_kt[j,k] * exp(b_g[i,k] - b_gk[j,k])
-    #                    = sum_k (b_k[i,k]*exp(b_g[i,k])) * (b_kt[j,k]*exp(-b_gk[j,k]))
-    #         b_Aqk[i,j] = sum_k b_q[i,k] * 同上
-    #   等价  令 P[i,k] = b_k[i,k]*exp(b_g[i,k])*β[i],  Q[i,k] = b_q[i,k]*exp(b_g[i,k])
-    #         令 R[j,k] = b_kt[j,k]*exp(-b_gk[j,k])
-    #   则    b_A   = P · R^T   (BC×BC)
-    #         b_Aqk = Q · R^T * scale
-    # b_kt = b_k 本块，b_gk = b_g 本块（行就是 j），所以 R 直接 = b_k * exp(-b_g)
-    b_eg = exp(b_g)
-    b_emg = exp(-b_g)
-    b_R = b_k * b_emg                    # [BC, BK] 即 b_kt * exp(-b_gk)
-    b_P = b_k * b_eg * b_beta[:, None]   # [BC, BK]
-    b_Q = b_q * b_eg                     # [BC, BK]
+        p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
+        b_beta = tl.load(p_b, mask=m_A, other=0)
 
-    # [BC, BC] = [BC, BK] @ [BK, BC]
-    b_A = tl.dot(b_P, tl.trans(b_R))
-    b_Aqk = tl.dot(b_Q, tl.trans(b_R)) * scale
+        # === 优化 A：用 tl.dot 替代 BC 轮 vec reduce，走 cube ===
+        b_eg = exp(b_g)
+        b_emg = exp(-b_g)
+        b_R = b_k * b_emg                    # [BC, BK]
+        b_P = b_k * b_eg * b_beta[:, None]   # [BC, BK]
+        b_Q = b_q * b_eg                     # [BC, BK]
 
-    # 下三角 mask：原代码 b_A 用 o_i > j（严格下三角，对角=0）
-    #            b_Aqk 用 o_i >= j（包含对角）
-    b_A = tl.where(o_i[:, None] > o_i[None, :], b_A, 0.0)
-    b_Aqk = tl.where(o_i[:, None] >= o_i[None, :], b_Aqk, 0.0)
+        b_A = tl.dot(b_P, tl.trans(b_R))
+        b_Aqk = tl.dot(b_Q, tl.trans(b_R)) * scale
 
-    # 写出 [BC, BC] 块
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT,
-        (T, BT),
-        (H * BT, 1),
-        (i_t * BT + i_i * BC, i_i * BC),
-        (BC, BC),
-        (1, 0),
-    )
-    p_Aqk = tl.make_block_ptr(
-        Aqk + (bos * H + i_h) * BT,
-        (T, BT),
-        (H * BT, 1),
-        (i_t * BT + i_i * BC, i_i * BC),
-        (BC, BC),
-        (1, 0),
-    )
-    tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+        b_A = tl.where(o_i[:, None] > o_i[None, :], b_A, 0.0)
+        b_Aqk = tl.where(o_i[:, None] >= o_i[None, :], b_Aqk, 0.0)
+
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + i_i * BC, i_i * BC),
+            (BC, BC),
+            (1, 0),
+        )
+        p_Aqk = tl.make_block_ptr(
+            Aqk + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + i_i * BC, i_i * BC),
+            (BC, BC),
+            (1, 0),
+        )
+        tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
@@ -835,7 +824,10 @@ def chunk_kda_scaled_dot_kkt_fwd(
         NC=NC,
     )
 
-    grid = (NT, NC, B * H)
+    H_PACK_INTRA = (
+        8 if H % 8 == 0 else (4 if H % 4 == 0 else (2 if H % 2 == 0 else 1))
+    )
+    grid = (NT, NC, B * (H // H_PACK_INTRA))
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
         q=q,
         k=k,
@@ -852,6 +844,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         BK=BK,
+        H_PACK=H_PACK_INTRA,
     )
     return A, Aqk
 
