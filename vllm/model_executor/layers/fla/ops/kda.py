@@ -1076,9 +1076,12 @@ def chunk_gla_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    H_PACK: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_v, i_t, i_bp = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    HP: tl.constexpr = H // H_PACK
+    i_b = i_bp // HP
+    i_hp = i_bp % HP
     if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = (
@@ -1096,50 +1099,53 @@ def chunk_gla_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_qg = tl.make_block_ptr(
-            qg + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
+    for i_pack in tl.static_range(H_PACK):
+        i_h = i_hp * H_PACK + i_pack
+
+        b_o = tl.zeros([BT, BV], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            p_qg = tl.make_block_ptr(
+                qg + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_h_trans = tl.make_block_ptr(
+                h_trans + (i_tg * H + i_h) * K * V,
+                (K, V),
+                (V, 1),
+                (i_k * BK, i_v * BV),
+                (BK, BV),
+                (1, 0),
+            )
+            b_qg = tl.load(p_qg, boundary_check=(0,))
+            b_ht = tl.load(p_h_trans)
+            b_o += tl.dot(b_qg, b_ht)
+        p_v = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
             (1, 0),
         )
-        p_h_trans = tl.make_block_ptr(
-            h_trans + (i_tg * H + i_h) * K * V,
-            (K, V),
-            (V, 1),
-            (i_k * BK, i_v * BV),
-            (BK, BV),
+        p_o = tl.make_block_ptr(
+            o + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
             (1, 0),
         )
-        b_qg = tl.load(p_qg, boundary_check=(0,))
-        b_ht = tl.load(p_h_trans)
-        b_o += tl.dot(b_qg, b_ht)
-    p_v = tl.make_block_ptr(
-        v + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_o = tl.make_block_ptr(
-        o + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    b_v = tl.load(p_v, boundary_check=(0,))
-    b_A = tl.load(p_A, boundary_check=(0,)).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+        )
+        b_v = tl.load(p_v, boundary_check=(0,))
+        b_A = tl.load(p_A, boundary_check=(0,)).to(b_v.dtype)
+        b_o += tl.dot(b_A, b_v)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
 def chunk_gla_fwd_o_gk(
@@ -1170,8 +1176,12 @@ def chunk_gla_fwd_o_gk(
         torch.tril(torch.ones(BT, BT, dtype=A.dtype, device=A.device))[:, None, :]
     )
 
+    H_PACK = (
+        8 if H % 8 == 0 else (4 if H % 4 == 0 else (2 if H % 2 == 0 else 1))
+    )
+
     def grid(meta):
-        return (cdiv(V, meta["BV"]), NT, B * H)
+        return (cdiv(V, meta["BV"]), NT, B * (H // H_PACK))
 
     chunk_gla_fwd_kernel_o[grid](
         qg=qg,
@@ -1186,6 +1196,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        H_PACK=H_PACK,
     )
     return o
 
