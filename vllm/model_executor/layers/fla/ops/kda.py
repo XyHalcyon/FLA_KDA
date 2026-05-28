@@ -563,7 +563,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     A += (bos * H + i_h) * BT
     Aqk += (bos * H + i_h) * BT
 
-    for i_i in range(1, NC):
+    for i_i in tl.static_range(1, NC):
         if i_t * BT + i_i * BC < T:
             p_b = tl.make_block_ptr(
                 beta + bos * H + i_h,
@@ -596,10 +596,12 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
             )
             b_g = tl.load(p_g, boundary_check=(0, 1))
             b_eg = exp(b_g - b_gn[None, :])
-            b_kg = tl.load(p_k, boundary_check=(0, 1)) * b_eg
+            # === 优化 2：β 预先折进 b_kg，省掉 dot 尾乘 ===
+            b_kg = tl.load(p_k, boundary_check=(0, 1)) * b_eg * b_b[:, None]
             b_qg = tl.load(p_q, boundary_check=(0, 1)) * b_eg * scale
 
-            for i_j in range(0, i_i):
+            # === 优化 1：i_j 循环静态展开，偏移变编译期立即数 ===
+            for i_j in tl.static_range(0, i_i):
                 b_kt = tl.make_block_ptr(
                     k, (K, T), (1, H * K),
                     (0, i_t * BT + i_j * BC),
@@ -614,8 +616,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
                 b_kt_val = tl.load(b_kt, boundary_check=(0, 1))
                 b_ktg = b_kt_val * exp(b_gn[:, None] - b_gk)
 
-                # === 方向 3：β 折进 dot 尾乘，去掉累加器 ===
-                b_A = tl.dot(b_kg, b_ktg) * b_b[:, None]
+                b_A = tl.dot(b_kg, b_ktg)
                 b_Aqk = tl.dot(b_qg, b_ktg)
 
                 p_A = tl.make_block_ptr(
