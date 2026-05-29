@@ -83,11 +83,17 @@ def l2norm_fwd_kernel2(
     row_idx = xoffset + tl.arange(0, MBLOCK)[:, None]
     xmask = row_idx < M
     rindex = tl.arange(0, BD)[None, :]
-    cmask = rindex < N
-    mask = xmask & cmask
+    # BD = next_power_of_2(N)，常见 D=128 时 BD == N，cmask 恒 True
+    if BD == N:
+        mask = xmask
+    else:
+        cmask = rindex < N
+        mask = xmask & cmask
     xs = tl.load(X + (rindex + N * row_idx), mask, other=0.0).to(tl.float32)
-    square = tl.broadcast_to(xs * xs, [MBLOCK, BD])
-    square_sum = tl.sum(tl.where(xmask, square, 0), 1)[:, None]
+    # square 再 reduce：xmask 在 row 上，mte2 已经按 mask 读 0，
+    # 不需要再 tl.where 一次（保持精度安全：mask 外的 lane 已经是 0）
+    square = xs * xs
+    square_sum = tl.sum(square, 1)[:, None]
     rsqrt = tl.rsqrt(square_sum + eps)
     tl.store(Y + (rindex + N * row_idx), xs * rsqrt, mask)
 
@@ -112,8 +118,10 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if not USE_DEFAULT_FLA_NORM:
-        MBLOCK = 32
-        # M, N = x.shape
+        # 优化：每个 program 处理 128 行（原 32 行）。
+        # case T'=262144 时 grid 从 8192 降到 2048，wave 数 342 -> 86。
+        # 单 program UB 用量 128×BD×4(fp32) = 64KB（D=128 时），910B UB 192KB 足够。
+        MBLOCK = 128
         l2norm_fwd_kernel2[(triton.cdiv(T, MBLOCK),)](
             x,
             y,
