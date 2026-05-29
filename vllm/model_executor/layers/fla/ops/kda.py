@@ -851,7 +851,6 @@ def chunk_kda_scaled_dot_kkt_fwd(
 
 @triton.heuristics(
     {
-        "STORE_QG": lambda args: args["qg"] is not None,
         "STORE_KG": lambda args: args["kg"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
@@ -870,9 +869,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
-    q,
     k,
-    qg,
     kg,
     v,
     beta,
@@ -889,13 +886,18 @@ def recompute_w_u_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    H_PACK: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
+    # 优化 1：BK >= K, BV >= V 已由 caller 显式拍平到 128，i_k/i_v 单步
+    tl.static_assert(BK >= K)
+    tl.static_assert(BV >= V)
+    i_t, i_bp = tl.program_id(0), tl.program_id(1)
+    HP: tl.constexpr = H // H_PACK
+    i_b = i_bp // HP
+    i_hp = i_bp % HP
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -908,103 +910,68 @@ def recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_b = tl.load(p_b, boundary_check=(0,))
 
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+    # === 优化 2：H_PACK 静态展开 H_PACK 个 head，bos/last_idx 不依赖 head 只算一次 ===
+    last_idx = min(i_t * BT + BT, T) - 1
 
-    for i_v in range(tl.cdiv(V, BV)):
+    for i_pack in tl.static_range(H_PACK):
+        i_h = i_hp * H_PACK + i_pack
+
+        p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        b_b = tl.load(p_b, boundary_check=(0,))
+
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+        )
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+
+        # ==== u = A · (β·v) ====  (i_v 单步)
         p_v = tl.make_block_ptr(
             v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
+            (T, V), (H * V, 1),
+            (i_t * BT, 0), (BT, BV), (1, 0),
         )
         p_u = tl.make_block_ptr(
             u + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
+            (T, V), (H * V, 1),
+            (i_t * BT, 0), (BT, BV), (1, 0),
         )
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb, input_precision=DOT_PRECISION)
         tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
 
-    for i_k in range(tl.cdiv(K, BK)):
-        p_w = tl.make_block_ptr(
-            w + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
+        # ==== w = A · (β·k·exp(gk)) ====  (i_k 单步)
         p_k = tl.make_block_ptr(
             k + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+            (T, K), (H * K, 1),
+            (i_t * BT, 0), (BT, BK), (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = b_k * b_b[:, None]
-
         p_gk = tl.make_block_ptr(
             gk + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+            (T, K), (H * K, 1),
+            (i_t * BT, 0), (BT, BK), (1, 0),
         )
+        p_w = tl.make_block_ptr(
+            w + (bos * H + i_h) * K,
+            (T, K), (H * K, 1),
+            (i_t * BT, 0), (BT, BK), (1, 0),
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
         b_gk = tl.load(p_gk, boundary_check=(0, 1))
-        b_kb *= exp(b_gk)
-        if STORE_QG:
-            p_q = tl.make_block_ptr(
-                q + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            p_qg = tl.make_block_ptr(
-                qg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_qg = b_q * exp(b_gk)
-            tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty), boundary_check=(0, 1))
-        if STORE_KG:
-            last_idx = min(i_t * BT + BT, T) - 1
+        b_kb = b_k * b_b[:, None] * exp(b_gk)
 
-            o_k = i_k * BK + tl.arange(0, BK)
+        if STORE_KG:
+            o_k = tl.arange(0, BK)
             m_k = o_k < K
             b_gn = tl.load(
                 gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
             )
-            b_kg = b_k * exp(b_gn - b_gk)
-
+            b_kg = b_k * exp(b_gn[None, :] - b_gk)
             p_kg = tl.make_block_ptr(
                 kg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
+                (T, K), (H * K, 1),
+                (i_t * BT, 0), (BT, BK), (1, 0),
             )
             tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1017,14 +984,14 @@ def recompute_w_u_fwd(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
+    # 优化 1：BK/BV 拍平到 next_pow2(K)/next_pow2(V)，让 i_k/i_v 单步
+    BK = max(next_power_of_2(K), 16)
+    BV = max(next_power_of_2(V), 16)
 
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
@@ -1034,10 +1001,12 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
-        q=q,
+    # 优化 2：H_PACK 自适应 8/4/2/1
+    H_PACK = (
+        8 if H % 8 == 0 else (4 if H % 4 == 0 else (2 if H % 2 == 0 else 1))
+    )
+    recompute_w_u_fwd_kernel[(NT, B * (H // H_PACK))](
         k=k,
-        qg=None,
         kg=kg,
         v=v,
         beta=beta,
@@ -1055,6 +1024,7 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         DOT_PRECISION="ieee",
+        H_PACK=H_PACK,
     )
     return w, u, None, kg
 
