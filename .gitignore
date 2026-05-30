@@ -249,3 +249,4 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 OPPROF*
 PROF*
 my_triton_cache*
+.omo*
